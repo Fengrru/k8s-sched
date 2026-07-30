@@ -46,7 +46,9 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.1
+          # Must be >= a golangci-lint built with Go 1.25, otherwise it
+          # cannot typecheck this module (go 1.25) and exits with code 3.
+          version: v2.12
 
   # Boots a real sched_ext kernel (Ubuntu mainline build) in a QEMU VM
   # via virtme-ng, then: dumps vmlinux.h from its BTF, compiles the BPF
