@@ -72,7 +72,7 @@ func TestAgent_Run_SchedulerFailure(t *testing.T) {
 		nodeName: "test-node",
 	}
 
-	// Run should return when context is cancelled, even if
+	// Run should return when context is canceled, even if
 	// scheduler loading fails and watcher can't start.
 	t.Setenv("SCHED_BPF_OBJ", "/tmp/does-not-exist.bpf.o")
 

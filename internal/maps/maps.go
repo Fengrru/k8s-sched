@@ -35,6 +35,8 @@ func initProcRoot() string {
 	return "/proc"
 }
 
+// TaskParams mirrors struct task_params in k8s_sched.bpf.c: the
+// per-task scheduling parameters the BPF scheduler reads at enqueue.
 type TaskParams struct {
 	Weight   uint64
 	BudgetNs uint64
@@ -47,6 +49,9 @@ type SchedStats struct {
 	Defaults     uint64
 }
 
+// Maps provides userspace access to the BPF maps that the loader
+// pinned under /sys/fs/bpf/k8s-sched, plus bookkeeping of the PIDs
+// written per pod so they can be removed on pod deletion.
 type Maps struct {
 	TaskParams *ebpf.Map
 	Stats      *ebpf.Map
@@ -102,6 +107,9 @@ func (m *Maps) TrackedPods() int {
 	return len(m.podPIDs)
 }
 
+// UpdatePodParams writes scheduling parameters for every host PID of
+// the pod into the task_params map. An optional resolved SchedParams
+// overrides annotation-derived values. Returns the first write error.
 func (m *Maps) UpdatePodParams(pod *corev1.Pod, resolved ...SchedParams) error {
 	if m.TaskParams == nil {
 		return nil
@@ -118,7 +126,7 @@ func (m *Maps) UpdatePodParams(pod *corev1.Pod, resolved ...SchedParams) error {
 	written := make([]uint32, 0, len(pids))
 	for _, pid := range pids {
 		pidKey := uint32(pid)
-		tp := TaskParams{Weight: params.Weight, BudgetNs: params.BudgetNs}
+		tp := TaskParams(params)
 		if err := m.TaskParams.Put(&pidKey, &tp); err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("put pid %d: %w", pid, err)
@@ -138,6 +146,8 @@ func (m *Maps) UpdatePodParams(pod *corev1.Pod, resolved ...SchedParams) error {
 	return firstErr
 }
 
+// RemovePodParams deletes the task_params entries for all PIDs
+// previously recorded for the pod (and any still resolvable now).
 func (m *Maps) RemovePodParams(pod *corev1.Pod) {
 	if m.TaskParams == nil || pod == nil {
 		return
@@ -177,7 +187,7 @@ type schedParams struct {
 
 const (
 	defaultWeight   uint64 = 1000
-	defaultBudgetNs        = 0
+	defaultBudgetNs uint64 = 0
 )
 
 const (

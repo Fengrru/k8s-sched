@@ -89,17 +89,17 @@ func TestCache_Eviction(t *testing.T) {
 	}
 
 	// "1 < 2" should have been evicted (it was oldest).
-	_, ok := c.peek("1 < 2")
+	ok := c.peek("1 < 2")
 	if ok {
 		t.Fatal("oldest entry '1 < 2' should have been evicted, but was still in cache")
 	}
 
 	// "2 < 3" and "3 < 4" should still be in cache.
-	_, ok = c.peek("2 < 3")
+	ok = c.peek("2 < 3")
 	if !ok {
 		t.Fatal("entry '2 < 3' should still be in cache")
 	}
-	_, ok = c.peek("3 < 4")
+	ok = c.peek("3 < 4")
 	if !ok {
 		t.Fatal("entry '3 < 4' should still be in cache")
 	}
@@ -133,11 +133,11 @@ func TestCache_Concurrency(t *testing.T) {
 }
 
 // Helper to avoid modifying cache.go for tests.
-func (c *Cache) evaluate(expr string, vars map[string]interface{}) (bool, bool) {
+func (c *Cache) evaluate(expr string, vars map[string]interface{}) (result, ok bool) {
 	c.mu.RLock()
-	entry, ok := c.entries[expr]
+	entry, found := c.entries[expr]
 	c.mu.RUnlock()
-	if !ok {
+	if !found {
 		return false, false
 	}
 	v, err := c.runProgram(entry.program, vars)

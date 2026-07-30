@@ -411,7 +411,8 @@ func (r *Resolver) celConditionPasses(policy *v1alpha1.SchedulingPolicy, pod *co
 
 // aggregatePodCPU sums CPU requests and limits across all containers.
 func aggregatePodCPU(pod *corev1.Pod) (request, limit float64) {
-	for _, c := range pod.Spec.Containers {
+	for i := range pod.Spec.Containers {
+		c := &pod.Spec.Containers[i]
 		if q := c.Resources.Requests.Cpu(); q != nil {
 			request += float64(q.MilliValue()) / 1000.0
 		}

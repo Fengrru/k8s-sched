@@ -40,9 +40,9 @@ func TestRealKernel_LoadAttachSchedule(t *testing.T) {
 	defer a.schedLink.Close()
 
 	// The kernel exposes the active root scheduler in sysfs.
-	ops, err := os.ReadFile("/sys/kernel/sched_ext/root/ops")
-	if err != nil {
-		t.Fatalf("read sched_ext sysfs (kernel without CONFIG_SCHED_CLASS_EXT?): %v", err)
+	ops, readErr := os.ReadFile("/sys/kernel/sched_ext/root/ops")
+	if readErr != nil {
+		t.Fatalf("read sched_ext sysfs (kernel without CONFIG_SCHED_CLASS_EXT?): %v", readErr)
 	}
 	if got := strings.TrimSpace(string(ops)); got != "k8s_sched" {
 		t.Fatalf("active scheduler = %q, want k8s_sched", got)

@@ -39,6 +39,9 @@ const (
 	statsExportFreq    = 15 * time.Second
 )
 
+// Agent is the per-node control loop: it watches pods and policies,
+// resolves scheduling parameters, writes them into the BPF maps, and
+// owns the sched_ext scheduler link and the metrics/health server.
 type Agent struct {
 	log         *zap.Logger
 	nodeName    string
@@ -54,6 +57,9 @@ type Agent struct {
 	metricsSrv *http.Server
 }
 
+// NewAgent constructs an Agent wired to the cluster (in-cluster config
+// when available) for the given node. It does not load the scheduler;
+// call Run for that.
 func NewAgent(ctx context.Context, log *zap.Logger, nodeName, metricsAddr string) (*Agent, error) {
 	if metricsAddr == "" {
 		metricsAddr = defaultMetricsPort
@@ -109,6 +115,9 @@ func NewAgent(ctx context.Context, log *zap.Logger, nodeName, metricsAddr string
 	}, nil
 }
 
+// Run loads the scheduler (falling back to observe-only mode if it
+// cannot attach), starts the watchers and metrics server, and blocks
+// until ctx is cancelled, then tears everything down.
 func (a *Agent) Run(ctx context.Context) error {
 	schedLoaded := false
 	if err := a.loadScheduler(); err != nil {
@@ -135,7 +144,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	// Start metrics + health HTTP server.
-	a.startMetricsServer(ctx)
+	a.startMetricsServer()
 
 	// Start periodic stale PID cleanup and BPF stats export.
 	go a.periodicPIDCleanup(ctx)
@@ -181,8 +190,8 @@ func (a *Agent) loadScheduler() error {
 		return fmt.Errorf("parse BPF spec: %w", err)
 	}
 
-	if err := os.MkdirAll(mapPinDir, 0o700); err != nil {
-		return fmt.Errorf("create pin dir %s: %w", mapPinDir, err)
+	if mkErr := os.MkdirAll(mapPinDir, 0o700); mkErr != nil {
+		return fmt.Errorf("create pin dir %s: %w", mapPinDir, mkErr)
 	}
 
 	// Load all maps, pin them so the maps package can open them later.
@@ -229,7 +238,7 @@ func (a *Agent) loadScheduler() error {
 
 // startMetricsServer starts an HTTP server exposing Prometheus metrics
 // and health check endpoints (/healthz, /readyz).
-func (a *Agent) startMetricsServer(ctx context.Context) {
+func (a *Agent) startMetricsServer() {
 	mux := http.NewServeMux()
 
 	addr := a.metricsAddr

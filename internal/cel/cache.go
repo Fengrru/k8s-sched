@@ -104,15 +104,12 @@ func (c *Cache) runProgram(prog cel.Program, vars map[string]interface{}) (bool,
 }
 
 // peek reports whether expr is already cached, without compiling it.
-// Used by tests to inspect eviction behaviour.
-func (c *Cache) peek(expr string) (cel.Program, bool) {
+// Used by tests to inspect eviction behavior.
+func (c *Cache) peek(expr string) bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	entry, ok := c.entries[expr]
-	if !ok {
-		return nil, false
-	}
-	return entry.program, true
+	_, ok := c.entries[expr]
+	return ok
 }
 
 func (c *Cache) compile(expr string) (cel.Program, error) {
@@ -139,7 +136,7 @@ func (c *Cache) compile(expr string) (cel.Program, error) {
 func (c *Cache) evictIfNeeded() {
 	for len(c.entries) >= c.capacity {
 		var oldestKey string
-		var oldestClock uint64 = ^uint64(0)
+		oldestClock := ^uint64(0)
 		for k, e := range c.entries {
 			if clk := e.clock.Load(); clk < oldestClock {
 				oldestClock = clk
