@@ -205,7 +205,7 @@ func (a *Agent) loadScheduler() error {
 		if name == "k8s_sched" {
 			continue // struct_ops map; not needed from userspace
 		}
-		if err := m.Pin(filepath.Join(mapPinDir, name)); err != nil {
+		if err = m.Pin(filepath.Join(mapPinDir, name)); err != nil {
 			coll.Close()
 			return fmt.Errorf("pin map %s: %w", name, err)
 		}
