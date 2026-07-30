@@ -12,6 +12,10 @@ import (
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	var (
 		nodeName    string
 		metricsAddr string
@@ -31,7 +35,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer log.Sync()
+	defer func() { _ = log.Sync() }()
 
 	ctx, cancel := signal.NotifyContext(
 		context.Background(),
@@ -42,12 +46,15 @@ func main() {
 
 	agent, err := sched.NewAgent(ctx, log, nodeName, metricsAddr)
 	if err != nil {
-		log.Fatal("failed to create agent", zap.Error(err))
+		log.Error("failed to create agent", zap.Error(err))
+		return 1
 	}
 
 	if err := agent.Run(ctx); err != nil {
-		log.Fatal("agent failed", zap.Error(err))
+		log.Error("agent failed", zap.Error(err))
+		return 1
 	}
 
 	log.Info("agent stopped")
+	return 0
 }

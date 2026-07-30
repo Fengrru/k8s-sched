@@ -63,7 +63,7 @@ func (w *PodWatcher) Start(stopCh <-chan struct{}) {
 	)
 
 	informer := factory.Core().V1().Pods().Informer()
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	if _, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			pod, ok := obj.(*corev1.Pod)
 			if !ok {
@@ -92,7 +92,10 @@ func (w *PodWatcher) Start(stopCh <-chan struct{}) {
 			}
 			w.onDelete(pod)
 		},
-	})
+	}); err != nil {
+		w.log.Error("failed to register pod event handler", zap.Error(err))
+		return
+	}
 
 	go informer.Run(stopCh)
 

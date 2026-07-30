@@ -116,8 +116,8 @@ func (a *Agent) Run(ctx context.Context) error {
 			zap.Error(err))
 	} else {
 		schedLoaded = true
-		defer a.schedLink.Close()
-		defer os.RemoveAll(mapPinDir)
+		defer func() { _ = a.schedLink.Close() }()
+		defer func() { _ = os.RemoveAll(mapPinDir) }()
 		if err := a.mapOps.Open(); err != nil {
 			a.log.Warn("cannot open BPF maps", zap.Error(err))
 		}
@@ -158,7 +158,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	if a.metricsSrv != nil {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		a.metricsSrv.Shutdown(shutdownCtx)
+		_ = a.metricsSrv.Shutdown(shutdownCtx)
 	}
 
 	return nil
@@ -243,15 +243,15 @@ func (a *Agent) startMetricsServer(ctx context.Context) {
 	// Health checks.
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		if a.ready.Load() {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("ready"))
+			_, _ = w.Write([]byte("ready"))
 		} else {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte("not ready"))
+			_, _ = w.Write([]byte("not ready"))
 		}
 	})
 

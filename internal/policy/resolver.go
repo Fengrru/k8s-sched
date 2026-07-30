@@ -91,7 +91,7 @@ func (r *Resolver) Start(stopCh <-chan struct{}) {
 	)
 
 	informer := factory.ForResource(schedulingPolicyGVR).Informer()
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	if _, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			policy := r.unstructuredToPolicy(obj)
 			if policy == nil {
@@ -113,7 +113,12 @@ func (r *Resolver) Start(stopCh <-chan struct{}) {
 			}
 			r.removePolicy(policy.Name)
 		},
-	})
+	}); err != nil {
+		r.log.Warn("cannot register policy event handler, falling back to polling",
+			zap.Error(err))
+		go r.pollPolicies(stopCh)
+		return
+	}
 
 	go informer.Run(stopCh)
 
