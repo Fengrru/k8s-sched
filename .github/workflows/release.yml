@@ -19,12 +19,12 @@ jobs:
       SCX_KERNEL: v6.14
       BPFTOOL_VERSION: v7.5.0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: "1.25"
           cache: true
@@ -61,7 +61,7 @@ jobs:
           vng --verbose --rw -r "$SCX_KERNEL" -- bash hack/vm-smoke.sh
 
       - name: Build Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -105,7 +105,7 @@ jobs:
           } > CHANGELOG_BODY.md
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           body_path: CHANGELOG_BODY.md
           draft: false
