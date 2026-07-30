@@ -194,21 +194,21 @@ func (a *Agent) loadScheduler() error {
 		return fmt.Errorf("create pin dir %s: %w", mapPinDir, mkErr)
 	}
 
-	// Load all maps.
-	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{})
-	if err != nil {
-		return fmt.Errorf("load BPF collection: %w", err)
-	}
-
-	// Pin maps explicitly so the maps package can open them later.
-	for name, m := range coll.Maps {
-		if name == "k8s_sched" {
+	// Mark maps for pinning so they survive the collection lifecycle.
+	for _, ms := range spec.Maps {
+		if ms.Name == "k8s_sched" {
 			continue // struct_ops map; not needed from userspace
 		}
-		if err = m.Pin(filepath.Join(mapPinDir, name)); err != nil {
-			coll.Close()
-			return fmt.Errorf("pin map %s: %w", name, err)
-		}
+		ms.Pinning = ebpf.PinByName
+	}
+
+	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
+		Maps: ebpf.MapOptions{
+			PinPath: mapPinDir,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("load BPF collection: %w", err)
 	}
 
 	// Find the struct_ops link map.
