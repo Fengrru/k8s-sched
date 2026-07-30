@@ -26,13 +26,11 @@ if [ ! -d /sys/kernel/sched_ext ]; then
 	exit 1
 fi
 
-apt-get update -qq && apt-get install -yqq libbpf-dev >/dev/null
-
 # 1. vmlinux.h from the exact kernel the scheduler will run on.
 ./bin/bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h
 
 # 2. Compile BPF C -> .o (same invocation as `make generate-ebpf`).
-clang -O2 -target bpf -g -I bpf -c bpf/k8s_sched.bpf.c -o bpf/k8s_sched.bpf.o
+clang -O2 -target bpf -g -I bpf -I include -c bpf/k8s_sched.bpf.c -o bpf/k8s_sched.bpf.o
 
 # 3. Load, attach, and verify the scheduler end to end.
 mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf

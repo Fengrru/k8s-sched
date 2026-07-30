@@ -16,7 +16,7 @@ generate:
 
 # Compile eBPF C to .o (requires bpf/vmlinux.h, see generate-vmlinux)
 generate-ebpf:
-	clang -O2 -target bpf -g -I bpf -c bpf/k8s_sched.bpf.c -o bpf/k8s_sched.bpf.o
+	clang -O2 -target bpf -g -I bpf -I include -c bpf/k8s_sched.bpf.c -o bpf/k8s_sched.bpf.o
 
 # Generate vmlinux.h from running kernel BTF.
 # Required for BPF compilation on the target kernel.
