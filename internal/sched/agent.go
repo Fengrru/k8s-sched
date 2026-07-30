@@ -195,11 +195,12 @@ func (a *Agent) loadScheduler() error {
 	}
 
 	// Mark maps for pinning so they survive the collection lifecycle.
+	// Only pin the maps that userspace needs to access.
+	pinMaps := map[string]bool{"task_params": true, "stats": true}
 	for _, ms := range spec.Maps {
-		if ms.Name == "k8s_sched" {
-			continue // struct_ops map; not needed from userspace
+		if pinMaps[ms.Name] {
+			ms.Pinning = ebpf.PinByName
 		}
-		ms.Pinning = ebpf.PinByName
 	}
 
 	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
