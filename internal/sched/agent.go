@@ -194,17 +194,21 @@ func (a *Agent) loadScheduler() error {
 		return fmt.Errorf("create pin dir %s: %w", mapPinDir, mkErr)
 	}
 
-	// Load all maps, pin them so the maps package can open them later.
-	// The .struct_ops map is special: it links the BPF ops to the kernel.
-	opts := ebpf.CollectionOptions{
-		Maps: ebpf.MapOptions{
-			PinPath: mapPinDir,
-		},
-	}
-
-	coll, err := ebpf.NewCollectionWithOptions(spec, opts)
+	// Load all maps.
+	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{})
 	if err != nil {
 		return fmt.Errorf("load BPF collection: %w", err)
+	}
+
+	// Pin maps explicitly so the maps package can open them later.
+	for name, m := range coll.Maps {
+		if name == "k8s_sched" {
+			continue // struct_ops map; not needed from userspace
+		}
+		if err := m.Pin(filepath.Join(mapPinDir, name)); err != nil {
+			coll.Close()
+			return fmt.Errorf("pin map %s: %w", name, err)
+		}
 	}
 
 	// Find the struct_ops link map.
