@@ -26,6 +26,8 @@ if [ ! -d /sys/kernel/sched_ext ]; then
 	exit 1
 fi
 
+apt-get update -qq && apt-get install -yqq libbpf-dev >/dev/null
+
 # 1. vmlinux.h from the exact kernel the scheduler will run on.
 ./bin/bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h
 
