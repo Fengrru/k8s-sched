@@ -1,0 +1,114 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/fengrru/k8s-sched
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# DaemonSet runs one agent per node.
+# Must run as privileged with hostPID to:
+#   - scan /proc for cgroup PID resolution
+#   - load BPF struct_ops into the kernel
+daemonSet:
+  annotations: {}
+
+  # PriorityClass for the DaemonSet pods.
+  # Should be system-node-critical to survive resource pressure.
+  priorityClassName: system-node-critical
+
+  # BPF .o file is bundled in the container image at /etc/k8s-sched/.
+  # Override this to use a ConfigMap-mounted BPF object.
+  bpfObjectPath: /etc/k8s-sched/k8s_sched.bpf.o
+
+  # Path to host /proc inside the container.
+  # When running with hostPID: true, the host /proc is typically
+  # available at /host/proc (mounted via hostPath volume).
+  hostProcPath: /host/proc
+
+  # Path to the host cgroup v2 filesystem inside the container.
+  # Needed for the fast cgroup.procs-based PID resolution path;
+  # without it the agent falls back to scanning /proc.
+  hostCgroupPath: /host/sys/fs/cgroup
+
+# Pod-level scheduling parameters can be set via annotations:
+#   scheduling.fengrru.dev/importance: "95"
+#   scheduling.fengrru.dev/weight: "9500"
+#   scheduling.fengrru.dev/budget-microseconds: "20000"
+
+# ServiceAccount for the agent. Needs:
+#   - get/list/watch pods (node-scoped)
+#   - get/list/watch schedulingpolicies (cluster-scoped)
+serviceAccount:
+  create: true
+  name: k8s-sched
+
+rbac:
+  create: true
+
+# Pod security context: must be privileged for BPF loading.
+podSecurityContext:
+  runAsUser: 0
+  runAsNonRoot: false
+
+containerSecurityContext:
+  privileged: true
+  allowPrivilegeEscalation: true
+  capabilities:
+    add:
+      - BPF
+      - SYS_ADMIN
+      - PERFMON
+      - NET_ADMIN
+      - SYS_RESOURCE
+    drop:
+      - ALL
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+# Agent tolerates all taints so it runs on every node.
+tolerations:
+  - operator: Exists
+
+nodeSelector: {}
+
+affinity: {}
+
+# Prometheus metrics endpoint
+metrics:
+  port: 9090
+  path: /metrics
+
+# ServiceMonitor for Prometheus Operator (optional)
+serviceMonitor:
+  enabled: false
+  interval: 30s
+
+# Liveness probe: checks if the agent process is alive.
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 9090
+  initialDelaySeconds: 10
+  periodSeconds: 30
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# Readiness probe: checks if the agent is ready to serve.
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 9090
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 2

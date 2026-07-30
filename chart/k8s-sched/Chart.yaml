@@ -1,0 +1,18 @@
+apiVersion: v2
+name: k8s-sched
+description: Kubernetes-native CPU scheduler powered by sched_ext + eBPF
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - sched-ext
+  - ebpf
+  - scheduler
+  - kubernetes
+  - cpu
+home: https://github.com/fengrru/k8s-sched
+sources:
+  - https://github.com/fengrru/k8s-sched
+maintainers:
+  - name: fengrru
+    email: fengrru@users.noreply.github.com

@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Install BPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-17 libbpf-dev
+
+      - name: go fmt
+        run: go fmt ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Run unit tests
+        run: go test -race -v -coverprofile=coverage.out -covermode=atomic ./internal/cel/ ./internal/maps/ ./internal/k8s/ ./internal/policy/
+
+      - name: Run vtime tests
+        run: go test -race -v -run TestVtime ./internal/maps/
+
+      - name: Upload coverage
+        if: github.event_name == 'push'
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.out
+          fail_ci_if_error: false
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.1
+
+  # Boots a real sched_ext kernel (Ubuntu mainline build) in a QEMU VM
+  # via virtme-ng, then: dumps vmlinux.h from its BTF, compiles the BPF
+  # scheduler against it, and runs a load+attach+schedule smoke test.
+  # This is the only place the BPF C code gets truly verified in CI.
+  bpf-verify:
+    name: BPF Verify (sched_ext VM)
+    runs-on: ubuntu-24.04
+    needs: lint-and-test
+    timeout-minutes: 30
+    env:
+      # Ubuntu mainline kernel with CONFIG_SCHED_CLASS_EXT=y.
+      SCX_KERNEL: v6.14
+      BPFTOOL_VERSION: v7.5.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Install clang, QEMU, virtme-ng, static bpftool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang qemu-system-x86 virtme-ng
+          mkdir -p bin
+          curl -fsSL "https://github.com/libbpf/bpftool/releases/download/${BPFTOOL_VERSION}/bpftool-${BPFTOOL_VERSION}-amd64.tar.gz" \
+            | tar -xz -C bin
+          chmod +x bin/bpftool
+
+      - name: Enable KVM for the runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || sudo chmod 666 /dev/kvm || true
+
+      - name: Pre-build smoke test binary
+        run: go test -c -o bin/sched-smoke.test ./internal/sched/
+
+      - name: vmlinux.h + BPF compile + smoke test (inside sched_ext VM)
+        run: vng --verbose --rw -r "$SCX_KERNEL" -- bash hack/vm-smoke.sh
+
+      - name: Upload BPF artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bpf-${{ github.sha }}
+          path: |
+            bpf/vmlinux.h
+            bpf/k8s_sched.bpf.o
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Build Go binary
+        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/agent ./cmd/agent
+
+      - name: Verify binary
+        run: file bin/agent && test -x bin/agent
+
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, bpf-verify]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      # vmlinux.h generated against a real sched_ext kernel by the
+      # bpf-verify job — NOT the runner kernel, which lacks sched_ext
+      # BTF types and would produce a broken BPF object.
+      - name: Download vmlinux.h from bpf-verify
+        uses: actions/download-artifact@v4
+        with:
+          name: bpf-${{ github.sha }}
+          path: bpf/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ghcr.io/fengrru/k8s-sched:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,41 @@
+{{- if .Values.rbac.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "k8s-sched.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "k8s-sched.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "k8s-sched.fullname" . }}
+  labels:
+    {{- include "k8s-sched.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["scheduling.fengrru.dev"]
+    resources: ["schedulingpolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["scheduling.fengrru.dev"]
+    resources: ["schedulingpolicies/status"]
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "k8s-sched.fullname" . }}
+  labels:
+    {{- include "k8s-sched.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "k8s-sched.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "k8s-sched.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

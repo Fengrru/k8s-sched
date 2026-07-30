@@ -1,0 +1,88 @@
+version: "2"
+
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  # standard set already enables: errcheck, govet, ineffassign, staticcheck, unused
+  default: standard
+  enable:
+    - bodyclose         # HTTP response body must be closed
+    - durationcheck     # Detects incorrect time.Duration multiplication
+    - goconst           # Finds repeated strings that could be constants
+    - gocritic          # Opinionated Go linter
+    - misspell          # Finds commonly misspelled English words
+    - nestif            # Reports deeply nested if statements
+    - nilerr            # Returns nil instead of error
+    - prealloc          # Finds slice declarations that could be preallocated
+    - revive            # Drop-in replacement for golint
+    - unconvert         # Detects unnecessary type conversions
+    - unparam           # Finds unused function parameters
+
+  settings:
+    errcheck:
+      check-blank: false
+      exclude-functions:
+        - (io.Closer).Close
+        - (net.Listener).Close
+        - (net.Conn).Close
+
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        - ifElseChain
+        - singleCaseSwitch
+
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment  # too noisy for this project size
+
+    misspell:
+      locale: US
+
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+        - name: increment-decrement
+        - name: var-naming
+        - name: package-comments
+          disabled: true  # not enforced at alpha stage
+
+  exclusions:
+    rules:
+      # Test files allow longer functions and more relaxed rules
+      - path: _test\.go
+        linters:
+          - errcheck
+          - goconst
+          - unparam
+          - unused
+
+      # Hand-written deepcopy / CRD types
+      - path: api/
+        linters:
+          - revive
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+issues:
+  max-issues-per-linter: 50
+  max-same-issues: 5

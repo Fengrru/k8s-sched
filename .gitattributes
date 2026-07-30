@@ -1,0 +1,13 @@
+# Normalize line endings: everything text is stored with LF.
+* text=auto
+
+# These must stay LF even when checked out on Windows —
+# shell scripts run inside the CI VM, Makefile needs literal tabs+LF.
+*.sh text eol=lf
+Makefile text eol=lf
+*.bpf.c text eol=lf
+*.bpf.h text eol=lf
+
+# Generated/vendored artifacts.
+*.o binary
+go.sum text eol=lf

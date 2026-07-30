@@ -1,0 +1,27 @@
+# BPF build artifacts
+*.o
+*.ll
+
+# Go build artifacts
+bin/
+
+# Go module vendor
+vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+coverage.out
+coverage.html
+
+# eBPF generated files
+bpf/vmlinux.h

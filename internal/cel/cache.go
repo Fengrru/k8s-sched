@@ -1,0 +1,154 @@
+// CEL evaluation cache (reused from Lymphocyte)
+//
+// LRU cache for precompiled CEL expressions.
+// Evaluates scheduling policy conditions like:
+//
+//	"signal.podCPU > context.cpuLimit * 0.8"
+//
+// Architecture: hashmap + atomic clock for LRU ordering. Lookups are
+// O(1); eviction scans linearly, which is fine for the small capacities
+// used here (policy CEL expressions number in the tens, not thousands).
+// Read path uses RLock (high concurrency), write path uses Lock.
+// Original source: github.com/fengrru/lymphocyte/internal/cel/cache.go
+package cel
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+
+	"github.com/google/cel-go/cel"
+)
+
+var globalClock atomic.Uint64
+
+// Cache provides an LRU cache of precompiled CEL programs.
+type Cache struct {
+	mu       sync.RWMutex
+	capacity int
+	entries  map[string]*cacheEntry
+}
+
+type cacheEntry struct {
+	// clock is updated on every cache hit while only the read lock is
+	// held, so it must be atomic to stay race-free.
+	clock   atomic.Uint64
+	program cel.Program
+}
+
+// NewCache creates a CEL program cache with the given capacity.
+func NewCache(capacity int) *Cache {
+	return &Cache{
+		capacity: capacity,
+		entries:  make(map[string]*cacheEntry, capacity),
+	}
+}
+
+// Evaluate checks if the CEL expression evaluates to true.
+// Expressions are cached by their source string.
+func (c *Cache) Evaluate(expr string, vars map[string]interface{}) (bool, error) {
+	prog, err := c.getOrCompile(expr)
+	if err != nil {
+		return false, err
+	}
+	return c.runProgram(prog, vars)
+}
+
+// getOrCompile returns a cached program or compiles and caches a new one.
+func (c *Cache) getOrCompile(expr string) (cel.Program, error) {
+	// Fast path: RLock for concurrent reads.
+	c.mu.RLock()
+	if entry, ok := c.entries[expr]; ok {
+		entry.clock.Store(globalClock.Add(1))
+		prog := entry.program
+		c.mu.RUnlock()
+		return prog, nil
+	}
+	c.mu.RUnlock()
+
+	// Slow path: compile with no lock held.
+	prog, err := c.compile(expr)
+	if err != nil {
+		return nil, fmt.Errorf("compile %q: %w", expr, err)
+	}
+
+	// Acquire write lock to insert into cache.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Double-check: another goroutine may have compiled the same expr.
+	if entry, ok := c.entries[expr]; ok {
+		entry.clock.Store(globalClock.Add(1))
+		return entry.program, nil
+	}
+
+	c.evictIfNeeded()
+
+	entry := &cacheEntry{program: prog}
+	entry.clock.Store(globalClock.Add(1))
+	c.entries[expr] = entry
+
+	return prog, nil
+}
+
+func (c *Cache) runProgram(prog cel.Program, vars map[string]interface{}) (bool, error) {
+	out, _, err := prog.Eval(vars)
+	if err != nil {
+		return false, fmt.Errorf("eval: %w", err)
+	}
+	b, ok := out.Value().(bool)
+	if !ok {
+		return false, fmt.Errorf("expression must return bool, got %T", out.Value())
+	}
+	return b, nil
+}
+
+// peek reports whether expr is already cached, without compiling it.
+// Used by tests to inspect eviction behaviour.
+func (c *Cache) peek(expr string) (cel.Program, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entry, ok := c.entries[expr]
+	if !ok {
+		return nil, false
+	}
+	return entry.program, true
+}
+
+func (c *Cache) compile(expr string) (cel.Program, error) {
+	env, err := cel.NewEnv(
+		cel.Variable("signal", cel.MapType(cel.StringType, cel.AnyType)),
+		cel.Variable("context", cel.MapType(cel.StringType, cel.AnyType)),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	ast, issues := env.Compile(expr)
+	if issues != nil && issues.Err() != nil {
+		return nil, issues.Err()
+	}
+
+	prog, err := env.Program(ast)
+	if err != nil {
+		return nil, err
+	}
+	return prog, nil
+}
+
+func (c *Cache) evictIfNeeded() {
+	for len(c.entries) >= c.capacity {
+		var oldestKey string
+		var oldestClock uint64 = ^uint64(0)
+		for k, e := range c.entries {
+			if clk := e.clock.Load(); clk < oldestClock {
+				oldestClock = clk
+				oldestKey = k
+			}
+		}
+		if oldestKey == "" {
+			return
+		}
+		delete(c.entries, oldestKey)
+	}
+}

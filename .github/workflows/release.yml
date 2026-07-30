@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # Ubuntu mainline kernel with CONFIG_SCHED_CLASS_EXT=y.
+      SCX_KERNEL: v6.14
+      BPFTOOL_VERSION: v7.5.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Install BPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang qemu-system-x86 virtme-ng
+          mkdir -p bin
+          curl -fsSL "https://github.com/libbpf/bpftool/releases/download/${BPFTOOL_VERSION}/bpftool-${BPFTOOL_VERSION}-amd64.tar.gz" \
+            | tar -xz -C bin
+          chmod +x bin/bpftool
+
+      - name: Enable KVM for the runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || sudo chmod 666 /dev/kvm || true
+
+      - name: Run tests
+        run: make test
+
+      - name: Build binary
+        run: make build
+
+      # Release gate: boot a real sched_ext kernel, dump vmlinux.h from
+      # its BTF, compile the BPF scheduler, and verify load+attach+
+      # scheduling before anything gets published. Leaves the verified
+      # bpf/vmlinux.h in place for the Docker build below.
+      - name: BPF compile + smoke test (inside sched_ext VM)
+        run: |
+          go test -c -o bin/sched-smoke.test ./internal/sched/
+          vng --verbose --rw -r "$SCX_KERNEL" -- bash hack/vm-smoke.sh
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/fengrru/k8s-sched:${{ github.ref_name }}
+            ghcr.io/fengrru/k8s-sched:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get commits since last tag
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            COMMITS=$(git log --oneline --no-decorate)
+          else
+            COMMITS=$(git log --oneline --no-decorate ${PREV_TAG}..HEAD)
+          fi
+
+          # Build changelog
+          {
+            echo "## What's Changed"
+            echo ""
+            echo "$COMMITS"
+            echo ""
+            echo "## Docker"
+            echo ""
+            echo "\`\`\`bash"
+            echo "docker pull ghcr.io/fengrru/k8s-sched:${{ github.ref_name }}"
+            echo "\`\`\`"
+            echo ""
+            echo "## Helm"
+            echo ""
+            echo "\`\`\`bash"
+            echo "helm install k8s-sched ./chart/k8s-sched \\"
+            echo "  --namespace kube-system \\"
+            echo "  --set image.repository=ghcr.io/fengrru/k8s-sched \\"
+            echo "  --set image.tag=${{ github.ref_name }}"
+            echo "\`\`\`"
+          } > CHANGELOG_BODY.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: CHANGELOG_BODY.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

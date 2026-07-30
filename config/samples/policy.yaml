@@ -1,0 +1,32 @@
+apiVersion: scheduling.fengrru.dev/v1alpha1
+kind: SchedulingPolicy
+metadata:
+  name: latency-critical
+spec:
+  podSelector:
+    matchLabels:
+      app: payment-api
+  weight: 9000
+  budgetMicroseconds: 2000  # cap slice at 2ms (default slice is 5ms)
+---
+apiVersion: scheduling.fengrru.dev/v1alpha1
+kind: SchedulingPolicy
+metadata:
+  name: batch-background
+spec:
+  podSelector:
+    matchLabels:
+      tier: batch
+  weight: 200
+---
+apiVersion: scheduling.fengrru.dev/v1alpha1
+kind: SchedulingPolicy
+metadata:
+  name: conditional-cpu-threshold
+spec:
+  podSelector:
+    matchLabels:
+      app: adaptive-worker
+  weight: 8500
+  budgetMicroseconds: 3000
+  celCondition: "signal.podName != ''"  # Example CEL condition
