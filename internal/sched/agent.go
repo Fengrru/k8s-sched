@@ -117,7 +117,7 @@ func NewAgent(ctx context.Context, log *zap.Logger, nodeName, metricsAddr string
 
 // Run loads the scheduler (falling back to observe-only mode if it
 // cannot attach), starts the watchers and metrics server, and blocks
-// until ctx is cancelled, then tears everything down.
+// until ctx is canceled, then tears everything down.
 func (a *Agent) Run(ctx context.Context) error {
 	schedLoaded := false
 	if err := a.loadScheduler(); err != nil {
