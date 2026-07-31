@@ -1,7 +1,13 @@
 package maps
 
 import (
+	"hash/fnv"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -233,5 +239,203 @@ func TestExtractSchedulingParams_UsesParsedFunctions(t *testing.T) {
 	}
 	if sp.BudgetNs != 0 {
 		t.Errorf("default budget = %d, want 0", sp.BudgetNs)
+	}
+}
+
+// ---- cgroup resolution ----------------
+
+// withCgroupBase swaps the package cgroup root for the duration of a test.
+func withCgroupBase(t *testing.T, base string) {
+	t.Helper()
+	old := cgroupV2Base
+	cgroupV2Base = base
+	t.Cleanup(func() { cgroupV2Base = old })
+}
+
+// withStubDirCgroupID replaces dirCgroupID with a deterministic hash
+// stub so cgroup-ID walks can be tested on any platform.
+func withStubDirCgroupID(t *testing.T) {
+	t.Helper()
+	old := dirCgroupID
+	dirCgroupID = func(path string) (uint64, bool) {
+		h := fnv.New64a()
+		_, _ = h.Write([]byte(path))
+		return h.Sum64(), true
+	}
+	t.Cleanup(func() { dirCgroupID = old })
+}
+
+func TestSystemdUID(t *testing.T) {
+	tests := []struct {
+		uid  string
+		want string
+	}{
+		{"abc-def-123", "abc_def_123"},
+		{"nodashes", "nodashes"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		if got := systemdUID(tt.uid); got != tt.want {
+			t.Errorf("systemdUID(%q) = %q, want %q", tt.uid, got, tt.want)
+		}
+	}
+}
+
+func TestPodCgroupDirCandidates(t *testing.T) {
+	base := t.TempDir()
+	withCgroupBase(t, base)
+
+	cands := podCgroupDirCandidates("abcd-1234")
+	want := []string{
+		base + "/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podabcd_1234.slice",
+		base + "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podabcd_1234.slice",
+		base + "/kubepods.slice/kubepods-podabcd_1234.slice", // guaranteed: no QoS sub-slice
+		base + "/kubepods/besteffort/podabcd-1234",
+		base + "/kubepods/burstable/podabcd-1234",
+		base + "/kubepods/podabcd-1234",
+	}
+	if !reflect.DeepEqual(cands, want) {
+		t.Errorf("podCgroupDirCandidates() = %v, want %v", cands, want)
+	}
+}
+
+// TestResolveViaCgroupV2_WalksLeaves verifies the cgroup v2 "no
+// internal processes" rule: the pod-level cgroup.procs is empty and
+// the PIDs live in the container scope leaves.
+func TestResolveViaCgroupV2_WalksLeaves(t *testing.T) {
+	base := t.TempDir()
+	withCgroupBase(t, base)
+
+	podDir := filepath.Join(base,
+		"kubepods.slice", "kubepods-burstable.slice",
+		"kubepods-burstable-podabc_123.slice")
+	if err := os.MkdirAll(filepath.Join(podDir, "cri-containerd-a.scope"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(podDir, "cri-containerd-b.scope"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Pod-level file exists but is empty (no internal processes).
+	if err := os.WriteFile(filepath.Join(podDir, "cgroup.procs"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(podDir, "cri-containerd-a.scope", "cgroup.procs"), []byte("100\n200\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(podDir, "cri-containerd-b.scope", "cgroup.procs"), []byte("300"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pids := resolveViaCgroupV2("abc-123")
+	sort.Slice(pids, func(i, j int) bool { return pids[i] < pids[j] })
+	want := []int32{100, 200, 300}
+	if !reflect.DeepEqual(pids, want) {
+		t.Errorf("resolveViaCgroupV2() = %v, want %v", pids, want)
+	}
+}
+
+// TestResolveViaCgroupV2_GuaranteedDirect verifies guaranteed-QoS pods
+// under the systemd driver sit directly under kubepods.slice.
+func TestResolveViaCgroupV2_GuaranteedDirect(t *testing.T) {
+	base := t.TempDir()
+	withCgroupBase(t, base)
+
+	podDir := filepath.Join(base, "kubepods.slice", "kubepods-podabc_123.slice")
+	if err := os.MkdirAll(filepath.Join(podDir, "cri-containerd-a.scope"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(podDir, "cri-containerd-a.scope", "cgroup.procs"), []byte("42"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pids := resolveViaCgroupV2("abc-123")
+	if len(pids) != 1 || pids[0] != 42 {
+		t.Errorf("resolveViaCgroupV2(guaranteed) = %v, want [42]", pids)
+	}
+}
+
+func TestResolvePodCgroupIDs_WalksSubtree(t *testing.T) {
+	base := t.TempDir()
+	withCgroupBase(t, base)
+	withStubDirCgroupID(t)
+
+	podDir := filepath.Join(base, "kubepods.slice", "kubepods-burstable.slice",
+		"kubepods-burstable-podabc_123.slice")
+	for _, leaf := range []string{"cri-containerd-a.scope", "cri-containerd-b.scope"} {
+		if err := os.MkdirAll(filepath.Join(podDir, leaf), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ids := resolvePodCgroupIDs("abc-123")
+	// Pod dir + two container leaves.
+	if len(ids) != 3 {
+		t.Errorf("resolvePodCgroupIDs() = %d ids, want 3 (pod + 2 leaves): %v", len(ids), ids)
+	}
+}
+
+func TestResolvePodCgroupIDs_EmptyUID(t *testing.T) {
+	if ids := resolvePodCgroupIDs(""); ids != nil {
+		t.Errorf("resolvePodCgroupIDs(empty) = %v, want nil", ids)
+	}
+}
+
+func TestLiveKubepodsCgroupIDs(t *testing.T) {
+	base := t.TempDir()
+	withCgroupBase(t, base)
+	withStubDirCgroupID(t)
+
+	// A live pod under the systemd driver and one under cgroupfs.
+	dirs := []string{
+		filepath.Join(base, "kubepods.slice", "kubepods-burstable.slice", "kubepods-burstable-podlive_1.slice"),
+		filepath.Join(base, "kubepods", "burstable", "podlive-2"),
+	}
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	live := liveKubepodsCgroupIDs()
+	// Every directory in the tree gets an ID (roots included).
+	if len(live) < 6 {
+		t.Errorf("liveKubepodsCgroupIDs() = %d ids, want >= 6", len(live))
+	}
+}
+
+// TestResolveViaProcScan_SystemdAndRawMarkers verifies the fallback
+// /proc scan matches both the raw UID (cgroupfs driver) and the
+// underscore form (systemd driver) of the pod marker.
+func TestResolveViaProcScan_SystemdAndRawMarkers(t *testing.T) {
+	procRoot := t.TempDir()
+	oldProc := ProcRoot
+	ProcRoot = procRoot
+	t.Cleanup(func() { ProcRoot = oldProc })
+
+	// Invalidate the /proc listing cache.
+	procCacheMu.Lock()
+	procCache = nil
+	procCacheExpiry = time.Time{}
+	procCacheMu.Unlock()
+
+	files := map[string]string{
+		"100": "0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podabc_123.slice/cri-containerd-x.scope\n",
+		"200": "0::/kubepods/burstable/podabc-123/cri-containerd-y.scope\n",
+		"300": "0::/other.slice/some.service\n",
+	}
+	for pid, cg := range files {
+		if err := os.MkdirAll(filepath.Join(procRoot, pid), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(procRoot, pid, "cgroup"), []byte(cg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pids := resolveViaProcScan("abc-123")
+	sort.Slice(pids, func(i, j int) bool { return pids[i] < pids[j] })
+	want := []int32{100, 200}
+	if !reflect.DeepEqual(pids, want) {
+		t.Errorf("resolveViaProcScan() = %v, want %v", pids, want)
 	}
 }

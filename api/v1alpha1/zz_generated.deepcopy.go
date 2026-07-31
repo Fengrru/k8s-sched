@@ -101,6 +101,20 @@ func (in *SchedulingPolicySpec) DeepCopy() *SchedulingPolicySpec {
 // DeepCopyInto is a deepcopy function, copying the receiver, writing into out. in must be non-nil.
 func (in *SchedulingPolicyStatus) DeepCopyInto(out *SchedulingPolicyStatus) {
 	*out = *in
+	if in.NodeStatuses != nil {
+		in, out := &in.NodeStatuses, &out.NodeStatuses
+		*out = make(map[string]map[string]int32, len(*in))
+		for key, val := range *in {
+			var outVal map[string]int32
+			if val != nil {
+				outVal = make(map[string]int32, len(val))
+				for k, v := range val {
+					outVal[k] = v
+				}
+			}
+			(*out)[key] = outVal
+		}
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]metav1.Condition, len(*in))

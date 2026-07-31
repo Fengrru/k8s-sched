@@ -57,6 +57,16 @@ extern s32 scx_bpf_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
 				  u64 wake_flags, bool *is_idle) __ksym;
 
 /*
+ * Cgroup helpers. scx_bpf_task_cgroup() returns the (acquired) cgroup
+ * of a task in an ops.* callback; requires CONFIG_EXT_GROUP_SCHED
+ * (SCHED_CLASS_EXT + CGROUP_SCHED, both enabled on stock 6.12+ distro
+ * kernels). The returned reference must be dropped with
+ * bpf_cgroup_release().
+ */
+extern struct cgroup *scx_bpf_task_cgroup(struct task_struct *p) __ksym;
+extern void bpf_cgroup_release(struct cgroup *cgrp) __ksym;
+
+/*
  * Struct ops definition macros.
  *
  * BPF_STRUCT_OPS expands to a BPF_PROG in the right ELF section so the

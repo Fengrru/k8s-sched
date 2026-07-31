@@ -17,16 +17,15 @@ spec:
   podSelector:
     matchLabels:
       tier: batch
-  weight: 200
+  weight: 200  # below the 1000 default: deprioritizes batch workloads
 ---
 apiVersion: scheduling.fengrru.dev/v1alpha1
 kind: SchedulingPolicy
 metadata:
-  name: conditional-cpu-threshold
+  name: crashloop-backoff
 spec:
   podSelector:
     matchLabels:
-      app: adaptive-worker
-  weight: 8500
-  budgetMicroseconds: 3000
-  celCondition: "signal.podName != ''"  # Example CEL condition
+      tier: batch
+  weight: 200  # crash-looping best-effort jobs lose priority
+  celCondition: "signal.podQOSClass == 'BestEffort' && signal.podRestartCount >= 3"

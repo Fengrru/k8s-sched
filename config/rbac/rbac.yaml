@@ -16,9 +16,14 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
   - apiGroups: ["scheduling.fengrru.dev"]
     resources: ["schedulingpolicies"]
     verbs: ["get", "list", "watch"]
+  # Status write-back: each node's agent reports its per-policy
+  # matching pod counts into SchedulingPolicy.status.nodeStatuses.
   - apiGroups: ["scheduling.fengrru.dev"]
     resources: ["schedulingpolicies/status"]
     verbs: ["get", "patch", "update"]

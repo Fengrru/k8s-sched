@@ -19,6 +19,15 @@ spec:
       hostPID: true
       serviceAccountName: {{ include "k8s-sched.serviceAccountName" . }}
       priorityClassName: {{ .Values.daemonSet.priorityClassName }}
+      # Must exceed the agent's HandoffDelay (15s): on SIGTERM the old
+      # agent keeps the sched_ext scheduler attached while the
+      # replacement attaches, so rolling upgrades never fall back to
+      # the kernel-default EEVDF.
+      terminationGracePeriodSeconds: {{ .Values.daemonSet.terminationGracePeriodSeconds }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -41,6 +50,7 @@ spec:
             - /agent
           args:
             - --node=$(NODE_NAME)
+            - --metrics-addr=:{{ .Values.metrics.port }}
           env:
             - name: NODE_NAME
               valueFrom:

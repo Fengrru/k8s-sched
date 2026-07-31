@@ -56,22 +56,27 @@ spec:
                   type: integer
                   minimum: 1
                   maximum: 10000
-                  default: 1000
-                  description: Scheduling weight. Higher = more CPU time.
+                  description: Scheduling weight. Higher = more CPU time; values below 1000 deprioritize a workload. 1000 is the default applied when no matching policy sets a weight.
                 budgetMicroseconds:
                   type: integer
                   minimum: 0
-                  default: 0
                   description: Max CPU time per scheduling slice (caps the 5ms default slice; values >= 5000 have no effect). 0 = unlimited.
                 celCondition:
                   type: string
-                  description: Optional CEL expression that must evaluate to true for the policy to apply. Variables - signal (pod metrics), context (policy context).
+                  description: "Optional CEL expression that must evaluate to true for the policy to apply. Variables: signal.podName/podNamespace/podUID (string), signal.podQOSClass (Guaranteed/Burstable/BestEffort), signal.podPriorityClass (string), signal.podRestartCount (int), signal.podCPURequest/podCPULimit (double, cores), signal.nodeName (string), context.policyName (string), context.weight/context.budgetUs (double, 0 when unset)."
             status:
               type: object
               properties:
                 activePods:
                   type: integer
                   description: Number of pods matching this policy.
+                nodeStatuses:
+                  type: object
+                  additionalProperties:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                  description: Per-node matching pod counts (node -> policy -> count). Written by each node's agent.
                 conditions:
                   type: array
                   items:

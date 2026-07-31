@@ -7,7 +7,9 @@ package maps
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,32 +46,39 @@ type TaskParams struct {
 
 // SchedStats mirrors struct sched_stats in k8s_sched.bpf.c.
 type SchedStats struct {
-	Enqueues     uint64
-	BudgetCapped uint64
-	Defaults     uint64
+	Enqueues        uint64
+	LocalDispatches uint64
+	BudgetCapped    uint64
+	Defaults        uint64
 }
 
 // Maps provides userspace access to the BPF maps that the loader
-// pinned under /sys/fs/bpf/k8s-sched, plus bookkeeping of the PIDs
-// written per pod so they can be removed on pod deletion.
+// pinned under /sys/fs/bpf/k8s-sched, plus bookkeeping of the cgroup
+// IDs and PIDs written per pod so they can be removed on pod deletion.
 type Maps struct {
-	TaskParams *ebpf.Map
-	Stats      *ebpf.Map
+	TaskParams   *ebpf.Map
+	CgroupParams *ebpf.Map
+	Stats        *ebpf.Map
 
-	mu      sync.Mutex
-	podPIDs map[string][]uint32 // pod UID -> PIDs written to the map
+	mu           sync.Mutex
+	podPIDs      map[string][]uint32 // pod UID -> fallback PIDs written
+	podCgroupIDs map[string][]uint64 // pod UID -> cgroup IDs written
 }
 
 // Pin paths where the BPF maps are pinned by the loader.
 const (
-	pinPath      = "/sys/fs/bpf/k8s-sched/task_params"
-	statsPinPath = "/sys/fs/bpf/k8s-sched/stats"
+	pinPath       = "/sys/fs/bpf/k8s-sched/task_params"
+	cgroupPinPath = "/sys/fs/bpf/k8s-sched/cgroup_params"
+	statsPinPath  = "/sys/fs/bpf/k8s-sched/stats"
 )
 
 // New returns an empty Maps. Call Open() after the scheduler has
 // loaded and pinned the BPF maps to connect.
 func New() *Maps {
-	return &Maps{podPIDs: make(map[string][]uint32)}
+	return &Maps{
+		podPIDs:      make(map[string][]uint32),
+		podCgroupIDs: make(map[string][]uint64),
+	}
 }
 
 // Open connects to pinned BPF maps. Safe to call multiple times.
@@ -80,6 +89,12 @@ func (m *Maps) Open() error {
 	}
 	m.TaskParams = tp
 
+	// Cgroup map is the primary parameter channel; degrade to
+	// PID-only writes when running against an older BPF object.
+	if cg, err := ebpf.LoadPinnedMap(cgroupPinPath, nil); err == nil {
+		m.CgroupParams = cg
+	}
+
 	// Stats map is optional: metrics export degrades gracefully without it.
 	if st, err := ebpf.LoadPinnedMap(statsPinPath, nil); err == nil {
 		m.Stats = st
@@ -87,31 +102,123 @@ func (m *Maps) Open() error {
 	return nil
 }
 
-// ReadStats reads the in-kernel scheduler counters.
-func (m *Maps) ReadStats() (SchedStats, error) {
-	var s SchedStats
-	if m.Stats == nil {
-		return s, fmt.Errorf("stats map not open")
+// PodDetails returns the current bookkeeping snapshot: which cgroup IDs
+// and PIDs were written per tracked pod. Used by the /debug endpoints.
+func (m *Maps) PodDetails() []PodDetail {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Merge bookkeeping into per-UID entries.
+	merged := make(map[string]*PodDetail)
+	for uid, ids := range m.podCgroupIDs {
+		merged[uid] = &PodDetail{UID: uid, CgroupIDs: append([]uint64(nil), ids...)}
 	}
-	var key uint32
-	if err := m.Stats.Lookup(&key, &s); err != nil {
-		return s, fmt.Errorf("lookup stats: %w", err)
+	for uid, pids := range m.podPIDs {
+		d, ok := merged[uid]
+		if !ok {
+			d = &PodDetail{UID: uid}
+			merged[uid] = d
+		}
+		d.PIDs = append([]uint32(nil), pids...)
 	}
-	return s, nil
+
+	out := make([]PodDetail, 0, len(merged))
+	for _, d := range merged {
+		out = append(out, *d)
+	}
+	return out
 }
 
-// TrackedPods returns the number of pods with PIDs recorded in the map.
+// PodDetail describes one tracked pod's bookkeeping snapshot.
+type PodDetail struct {
+	UID       string   `json:"uid"`
+	CgroupIDs []uint64 `json:"cgroupIds,omitempty"`
+	PIDs      []uint32 `json:"pids,omitempty"`
+}
+
+// ParamsDump is a snapshot of both BPF parameter maps for debugging.
+type ParamsDump struct {
+	CgroupEntries map[uint64]TaskParams `json:"cgroupEntries,omitempty"`
+	PIDEntries    map[uint32]TaskParams `json:"pidEntries,omitempty"`
+}
+
+// DumpParams iterates the parameter maps and returns their contents.
+func (m *Maps) DumpParams() (ParamsDump, error) {
+	dump := ParamsDump{
+		CgroupEntries: make(map[uint64]TaskParams),
+		PIDEntries:    make(map[uint32]TaskParams),
+	}
+	if m.CgroupParams != nil {
+		it := m.CgroupParams.Iterate()
+		var key uint64
+		var val TaskParams
+		for it.Next(&key, &val) {
+			dump.CgroupEntries[key] = val
+		}
+		if err := it.Err(); err != nil {
+			return dump, fmt.Errorf("iterate cgroup_params: %w", err)
+		}
+	}
+	if m.TaskParams != nil {
+		it := m.TaskParams.Iterate()
+		var key uint32
+		var val TaskParams
+		for it.Next(&key, &val) {
+			dump.PIDEntries[key] = val
+		}
+		if err := it.Err(); err != nil {
+			return dump, fmt.Errorf("iterate task_params: %w", err)
+		}
+	}
+	return dump, nil
+}
+
+func (m *Maps) ReadStats() (SchedStats, error) {
+	var out SchedStats
+	if m.Stats == nil {
+		return out, fmt.Errorf("stats map not open")
+	}
+	var key uint32
+	var perCPU []SchedStats
+	if err := m.Stats.Lookup(&key, &perCPU); err != nil {
+		// Older BPF objects use a plain array map.
+		if err2 := m.Stats.Lookup(&key, &out); err2 == nil {
+			return out, nil
+		}
+		return out, fmt.Errorf("lookup stats: %w", err)
+	}
+	for _, s := range perCPU {
+		out.Enqueues += s.Enqueues
+		out.LocalDispatches += s.LocalDispatches
+		out.BudgetCapped += s.BudgetCapped
+		out.Defaults += s.Defaults
+	}
+	return out, nil
+}
+
+// TrackedPods returns the number of pods with parameters recorded in
+// either the cgroup or the PID map.
 func (m *Maps) TrackedPods() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return len(m.podPIDs)
+	uids := make(map[string]bool, len(m.podCgroupIDs)+len(m.podPIDs))
+	for uid := range m.podCgroupIDs {
+		uids[uid] = true
+	}
+	for uid := range m.podPIDs {
+		uids[uid] = true
+	}
+	return len(uids)
 }
 
-// UpdatePodParams writes scheduling parameters for every host PID of
-// the pod into the task_params map. An optional resolved SchedParams
-// overrides annotation-derived values. Returns the first write error.
+// UpdatePodParams writes scheduling parameters for the pod into the
+// BPF maps. The preferred channel is one cgroup_params entry per
+// cgroup in the pod's subtree (covers processes forked later); when
+// the pod's cgroup cannot be found, it falls back to per-PID entries
+// in task_params. An optional resolved SchedParams overrides
+// annotation-derived values. Returns the first write error.
 func (m *Maps) UpdatePodParams(pod *corev1.Pod, resolved ...SchedParams) error {
-	if m.TaskParams == nil {
+	if m.TaskParams == nil || pod == nil {
 		return nil
 	}
 	var params SchedParams
@@ -120,13 +227,40 @@ func (m *Maps) UpdatePodParams(pod *corev1.Pod, resolved ...SchedParams) error {
 	} else {
 		params = extractSchedulingParams(pod)
 	}
-	pids := resolvePodPIDs(pod)
+	tp := TaskParams(params)
+	uid := string(pod.UID)
 
 	var firstErr error
+
+	// Preferred: cgroup-level entries for the whole pod subtree.
+	if m.CgroupParams != nil {
+		cgids := resolvePodCgroupIDs(uid)
+		if len(cgids) > 0 {
+			written := make([]uint64, 0, len(cgids))
+			for _, cgid := range cgids {
+				key := cgid
+				if err := m.CgroupParams.Put(&key, &tp); err != nil {
+					if firstErr == nil {
+						firstErr = fmt.Errorf("put cgroup %d: %w", cgid, err)
+					}
+					continue
+				}
+				written = append(written, key)
+			}
+			if uid != "" {
+				m.mu.Lock()
+				m.podCgroupIDs[uid] = written
+				m.mu.Unlock()
+			}
+			return firstErr
+		}
+	}
+
+	// Fallback: per-PID entries from /proc scanning.
+	pids := resolvePodPIDs(pod)
 	written := make([]uint32, 0, len(pids))
 	for _, pid := range pids {
 		pidKey := uint32(pid)
-		tp := TaskParams(params)
 		if err := m.TaskParams.Put(&pidKey, &tp); err != nil {
 			if firstErr == nil {
 				firstErr = fmt.Errorf("put pid %d: %w", pid, err)
@@ -138,15 +272,15 @@ func (m *Maps) UpdatePodParams(pod *corev1.Pod, resolved ...SchedParams) error {
 
 	// Remember which PIDs we wrote: by deletion time the pod's cgroup
 	// is usually gone and PID re-resolution would return nothing.
-	if pod != nil && pod.UID != "" {
+	if uid != "" {
 		m.mu.Lock()
-		m.podPIDs[string(pod.UID)] = written
+		m.podPIDs[uid] = written
 		m.mu.Unlock()
 	}
 	return firstErr
 }
 
-// RemovePodParams deletes the task_params entries for all PIDs
+// RemovePodParams deletes the cgroup_params and task_params entries
 // previously recorded for the pod (and any still resolvable now).
 func (m *Maps) RemovePodParams(pod *corev1.Pod) {
 	if m.TaskParams == nil || pod == nil {
@@ -155,12 +289,28 @@ func (m *Maps) RemovePodParams(pod *corev1.Pod) {
 
 	uid := string(pod.UID)
 	m.mu.Lock()
-	recorded := m.podPIDs[uid]
+	recordedPIDs := m.podPIDs[uid]
+	recordedCgIDs := m.podCgroupIDs[uid]
 	delete(m.podPIDs, uid)
+	delete(m.podCgroupIDs, uid)
 	m.mu.Unlock()
 
-	seen := make(map[uint32]bool, len(recorded))
-	for _, pid := range recorded {
+	if m.CgroupParams != nil {
+		cgSeen := make(map[uint64]bool, len(recordedCgIDs))
+		for _, cgid := range recordedCgIDs {
+			cgSeen[cgid] = true
+		}
+		for _, cgid := range resolvePodCgroupIDs(uid) {
+			cgSeen[cgid] = true
+		}
+		for cgid := range cgSeen {
+			key := cgid
+			m.CgroupParams.Delete(&key) //nolint:errcheck // best-effort; stale IDs are swept periodically
+		}
+	}
+
+	seen := make(map[uint32]bool, len(recordedPIDs))
+	for _, pid := range recordedPIDs {
 		seen[pid] = true
 	}
 	for _, pid := range resolvePodPIDs(pod) {
@@ -170,6 +320,40 @@ func (m *Maps) RemovePodParams(pod *corev1.Pod) {
 		pidKey := pid
 		m.TaskParams.Delete(&pidKey) //nolint:errcheck // best-effort; stale PIDs are swept periodically
 	}
+}
+
+// CleanStaleCgroupIDs removes cgroup_params entries whose cgroup no
+// longer exists on the host (pod gone, agent missed the delete event).
+// Returns the number of entries removed.
+func (m *Maps) CleanStaleCgroupIDs() int {
+	if m.CgroupParams == nil {
+		return 0
+	}
+	live := liveKubepodsCgroupIDs()
+	if len(live) == 0 {
+		// Cannot see the kubepods tree (transient mount issue?):
+		// deleting everything now would be worse than keeping
+		// stale entries for one more sweep.
+		return 0
+	}
+
+	var key uint64
+	var val TaskParams
+	var stale []uint64
+	iter := m.CgroupParams.Iterate()
+	for iter.Next(&key, &val) {
+		if !live[key] {
+			stale = append(stale, key)
+		}
+	}
+	removed := 0
+	for _, cgid := range stale {
+		k := cgid
+		if err := m.CgroupParams.Delete(&k); err == nil {
+			removed++
+		}
+	}
+	return removed
 }
 
 // SchedParams holds the scheduling parameters for a pod.
@@ -258,15 +442,17 @@ func extractSchedulingParams(pod *corev1.Pod) SchedParams {
 	return SchedParams{Weight: sp.weight, BudgetNs: sp.budgetNs}
 }
 
-// ---- Pod PID resolution via cgroup v2 ----
+// ---- Pod PID / cgroup resolution via cgroup v2 ----
 
 // resolvePodPIDs finds all host PIDs belonging to a pod.
 //
-// Primary path: reads cgroup.procs from the pod's cgroup v2 directory.
-// This is O(1) per pod instead of O(/proc size).
+// Primary path: walks the pod's cgroup v2 subtree and reads every
+// cgroup.procs. cgroup v2 forbids processes in non-leaf cgroups, so
+// the pod-level file is empty and the PIDs live in the container
+// scope leaves.
 //
 // Fallback: scans /proc/<pid>/cgroup for the pod UID marker.
-// Used when cgroup v2 path is not available.
+// Used when the pod's cgroup directory cannot be located.
 func resolvePodPIDs(pod *corev1.Pod) []int32 {
 	if pod == nil {
 		return nil
@@ -297,30 +483,117 @@ func initCgroupV2Base() string {
 	return "/sys/fs/cgroup"
 }
 
-// resolveViaCgroupV2 attempts to find the pod's PIDs via cgroup v2
-// cgroup.procs files. It tries common cgroup paths for Kubernetes pods.
-func resolveViaCgroupV2(podUID string) []int32 {
-	// Common QoS class paths under cgroup v2 with systemd driver.
-	// Format: /sys/fs/cgroup/kubepods.slice/kubepods-<qos>.slice/
-	//         kubepods-<qos>-pod<UID>.slice/cgroup.procs
-	suffixes := []string{
-		"kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod" + podUID + ".slice/cgroup.procs",
-		"kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod" + podUID + ".slice/cgroup.procs",
-		"kubepods.slice/kubepods-guaranteed.slice/kubepods-guaranteed-pod" + podUID + ".slice/cgroup.procs",
-		// cgroupfs driver (no systemd slices).
-		"kubepods/pod" + podUID + "/cgroup.procs",
-	}
+// systemdUID converts a pod UID to the form used in systemd slice
+// names: kubelet's systemd cgroup driver replaces dashes with
+// underscores (kubepods-burstable-pod<uid_with_underscores>.slice).
+func systemdUID(uid string) string {
+	return strings.ReplaceAll(uid, "-", "_")
+}
 
-	for _, suffix := range suffixes {
-		path := cgroupV2Base + "/" + suffix
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
+// podCgroupDirCandidates returns the possible cgroup v2 directories
+// for a pod across cgroup drivers and QoS classes. Note that with the
+// systemd driver, guaranteed pods sit directly under kubepods.slice
+// (there is no kubepods-guaranteed.slice).
+func podCgroupDirCandidates(uid string) []string {
+	sysd := systemdUID(uid)
+	return []string{
+		// systemd cgroup driver (kubeadm and most distros' default).
+		cgroupV2Base + "/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod" + sysd + ".slice",
+		cgroupV2Base + "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod" + sysd + ".slice",
+		cgroupV2Base + "/kubepods.slice/kubepods-pod" + sysd + ".slice",
+		// cgroupfs driver (no systemd slices, raw UID with dashes).
+		cgroupV2Base + "/kubepods/besteffort/pod" + uid,
+		cgroupV2Base + "/kubepods/burstable/pod" + uid,
+		cgroupV2Base + "/kubepods/pod" + uid,
+	}
+}
+
+// findPodCgroupDir locates the pod's cgroup v2 directory, or "" when
+// none of the known layouts match.
+func findPodCgroupDir(uid string) string {
+	for _, dir := range podCgroupDirCandidates(uid) {
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			return dir
 		}
-		return parseCgroupProcs(data)
+	}
+	return ""
+}
+
+// resolveViaCgroupV2 collects the pod's PIDs by walking its cgroup
+// subtree and reading every cgroup.procs file.
+func resolveViaCgroupV2(podUID string) []int32 {
+	dir := findPodCgroupDir(podUID)
+	if dir == "" {
+		return nil
 	}
 
-	return nil
+	var pids []int32
+	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil //nolint:nilerr // best-effort: skip unreadable entries
+		}
+		data, rerr := os.ReadFile(filepath.Join(path, "cgroup.procs"))
+		if rerr != nil {
+			return nil
+		}
+		pids = append(pids, parseCgroupProcs(data)...)
+		return nil
+	})
+	return pids
+}
+
+// ResolvePodCgroupIDs returns the cgroup IDs (kernfs inode numbers)
+// of the pod's cgroup directory and all of its descendants. These are
+// the keys of the BPF cgroup_params map.
+func ResolvePodCgroupIDs(pod *corev1.Pod) []uint64 {
+	if pod == nil {
+		return nil
+	}
+	return resolvePodCgroupIDs(string(pod.UID))
+}
+
+func resolvePodCgroupIDs(uid string) []uint64 {
+	if uid == "" {
+		return nil
+	}
+	dir := findPodCgroupDir(uid)
+	if dir == "" {
+		return nil
+	}
+
+	var ids []uint64
+	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil //nolint:nilerr // best-effort: skip unreadable entries
+		}
+		if id, ok := dirCgroupID(path); ok {
+			ids = append(ids, id)
+		}
+		return nil
+	})
+	return ids
+}
+
+// liveKubepodsCgroupIDs collects the cgroup IDs of every directory
+// currently under the kubepods roots, for stale-entry sweeping.
+func liveKubepodsCgroupIDs() map[uint64]bool {
+	roots := []string{
+		cgroupV2Base + "/kubepods.slice", // systemd driver
+		cgroupV2Base + "/kubepods",       // cgroupfs driver
+	}
+	live := make(map[uint64]bool)
+	for _, root := range roots {
+		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || !d.IsDir() {
+				return nil //nolint:nilerr // best-effort: skip unreadable entries
+			}
+			if id, ok := dirCgroupID(path); ok {
+				live[id] = true
+			}
+			return nil
+		})
+	}
+	return live
 }
 
 // parseCgroupProcs parses the content of a cgroup.procs file
@@ -345,10 +618,17 @@ func parseCgroupProcs(data []byte) []int32 {
 // resolveViaProcScan scans /proc/<pid>/cgroup for the pod UID marker.
 // This is the legacy fallback path.
 //
+// The marker is matched in both raw (cgroupfs driver: pod<uid>) and
+// systemd-slice form (pod<uid_with_underscores>), since the cgroup
+// path in /proc/<pid>/cgroup follows the driver's naming.
+//
 // Uses a short-lived TTL cache of the /proc directory listing to avoid
 // repeated os.ReadDir calls during bulk pod updates. Cache TTL is 5s.
 func resolveViaProcScan(podUID string) []int32 {
-	pidMarker := fmt.Sprintf("pod%s", podUID)
+	markers := []string{"pod" + podUID}
+	if sysd := systemdUID(podUID); sysd != podUID {
+		markers = append(markers, "pod"+sysd)
+	}
 
 	entries := getProcDirCache()
 
@@ -369,8 +649,12 @@ func resolveViaProcScan(podUID string) []int32 {
 			continue
 		}
 
-		if strings.Contains(string(data), pidMarker) {
-			pids = append(pids, int32(pid))
+		content := string(data)
+		for _, marker := range markers {
+			if strings.Contains(content, marker) {
+				pids = append(pids, int32(pid))
+				break
+			}
 		}
 	}
 

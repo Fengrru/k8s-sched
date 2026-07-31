@@ -2,9 +2,16 @@
  * k8s_sched - Kubernetes-aware sched_ext scheduler
  *
  * Implements weighted virtual time scheduling with per-task CPU budgets.
- * A Go DaemonSet agent watches Pod annotations and writes per-process
- * {weight, budget_ns} to the task_params BPF map, keyed by tgid
- * (the userspace notion of PID, shared by all threads of a process).
+ * A Go DaemonSet agent watches Pod annotations and writes per-pod
+ * {weight, budget_ns} to the cgroup_params BPF map, keyed by the
+ * cgroup ID (kernfs inode) of the pod's cgroup subtree. A secondary
+ * task_params map keyed by tgid serves as a fallback when cgroup
+ * resolution is unavailable in userspace.
+ *
+ * Keying by cgroup ID (instead of PID) means processes forked after
+ * the agent last scanned the pod inherit their pod's parameters
+ * automatically, and recycled PIDs can never pick up another pod's
+ * parameters.
  *
  * Scheduling algorithm:
  *   - Custom user DSQ ("k8s_vtime") supports vtime ordering.
@@ -42,8 +49,21 @@ struct task_params {
 	u64 budget_ns;
 };
 
-/* Keyed by tgid: cgroup.procs lists thread-group leaders, and every
- * thread of a process shares its pod's scheduling parameters. */
+/* Primary: keyed by cgroup ID (kernfs inode number) of any cgroup in
+ * a pod's subtree. The agent writes one entry for the pod directory
+ * and each descendant (container scopes), so every task in the pod
+ * resolves here — including processes forked at any later time. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16384);
+	__type(key, u64);
+	__type(value, struct task_params);
+} cgroup_params SEC(".maps");
+
+/* Fallback: keyed by tgid (cgroup.procs lists thread-group leaders,
+ * and every thread of a process shares its pod's parameters). Only
+ * populated when the agent cannot resolve the pod's cgroup subtree
+ * and had to fall back to /proc scanning. */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 65536);
@@ -53,12 +73,15 @@ struct {
 
 struct sched_stats {
 	u64 enqueues;
+	u64 local_dispatches; /* idle-CPU direct inserts from select_cpu */
 	u64 budget_capped;
-	u64 defaults;     /* tasks without params */
+	u64 defaults;         /* enqueues of tasks without params */
 };
 
+/* Per-CPU: written on every enqueue, so avoid a shared cache line
+ * bouncing between all cores. Userspace sums across CPUs. */
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, u32);
 	__type(value, struct sched_stats);
@@ -86,21 +109,64 @@ static inline bool vtime_before(u64 a, u64 b)
 	return (s64)(a - b) < 0;
 }
 
-static inline struct task_params get_task_params(u32 tgid)
+static inline struct sched_stats *get_stats(void)
 {
-	struct task_params *t = bpf_map_lookup_elem(&task_params, &tgid);
-	if (t)
-		return *t;
-
 	u32 key = 0;
-	struct sched_stats *s = bpf_map_lookup_elem(&stats, &key);
-	if (s)
-		__sync_fetch_and_add(&s->defaults, 1);
 
-	return (struct task_params){
-		.weight    = DEFAULT_WEIGHT,
-		.budget_ns = 0,
-	};
+	return bpf_map_lookup_elem(&stats, &key);
+}
+
+/*
+ * Cgroup ID of the task, for cgroup_params lookups. Callable from
+ * rq-locked ops.* callbacks on their task argument (same pattern as
+ * scx_flatcg). Returns 0 when the cgroup cannot be determined.
+ */
+static inline u64 task_cgroup_id(struct task_struct *p)
+{
+	struct cgroup *cgrp = scx_bpf_task_cgroup(p);
+	u64 cgid = 0;
+
+	if (cgrp) {
+		cgid = cgrp->kn->id;
+		bpf_cgroup_release(cgrp);
+	}
+	return cgid;
+}
+
+/*
+ * Resolve a task's scheduling parameters. Explicit per-process
+ * entries (fallback path) win over cgroup-level entries. Returns
+ * true when parameters were found, false when defaults apply.
+ * Stats are NOT touched here: callers that represent one scheduling
+ * decision (enqueue/select_cpu) count exactly once.
+ */
+static inline bool lookup_task_params(struct task_struct *p,
+				      struct task_params *tp)
+{
+	/* In-kernel p->pid is the thread ID; tgid is the process-level
+	 * PID that userspace writes, shared by all threads. */
+	u32 tgid = (u32)p->tgid;
+	struct task_params *t;
+	u64 cgid;
+
+	t = bpf_map_lookup_elem(&task_params, &tgid);
+	if (t) {
+		*tp = *t;
+		return true;
+	}
+
+	cgid = task_cgroup_id(p);
+	if (cgid) {
+		t = bpf_map_lookup_elem(&cgroup_params, &cgid);
+		if (t) {
+			*tp = *t;
+			return true;
+		}
+	}
+
+	tp->weight = DEFAULT_WEIGHT;
+	tp->budget_ns = 0;
+	return false;
 }
 
 /*
@@ -129,21 +195,27 @@ s32 BPF_STRUCT_OPS(k8s_select_cpu, struct task_struct *p,
 		 * immediately on that CPU's local DSQ. There is no
 		 * contention to arbitrate, so vtime ordering is moot.
 		 */
-		struct task_params tp = get_task_params((u32)p->tgid);
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(&tp), 0);
+		struct task_params tp;
+		u64 slice;
+
+		lookup_task_params(p, &tp);
+		slice = task_slice(&tp);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, 0);
+
+		struct sched_stats *s = get_stats();
+		if (s) {
+			s->local_dispatches++;
+			if (slice < DEFAULT_SLICE_NS)
+				s->budget_capped++;
+		}
 	}
 	return cpu;
 }
 
 void BPF_STRUCT_OPS(k8s_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	/*
-	 * Look up by tgid, not pid: in-kernel p->pid is the thread ID,
-	 * while the agent writes process-level PIDs (thread-group
-	 * leaders from cgroup.procs). tgid makes every thread of a
-	 * process inherit its pod's parameters.
-	 */
-	struct task_params tp = get_task_params((u32)p->tgid);
+	struct task_params tp;
+	bool found = lookup_task_params(p, &tp);
 	u64 slice = task_slice(&tp);
 	u64 vtime = p->scx.dsq_vtime;
 
@@ -158,14 +230,15 @@ void BPF_STRUCT_OPS(k8s_enqueue, struct task_struct *p, u64 enq_flags)
 
 	scx_bpf_dsq_insert_vtime(p, K8S_DSQ_ID, slice, vtime, enq_flags);
 
-	u32 key = 0;
-	struct sched_stats *s = bpf_map_lookup_elem(&stats, &key);
+	struct sched_stats *s = get_stats();
 	if (s) {
-		__sync_fetch_and_add(&s->enqueues, 1);
+		s->enqueues++;
 		/* Count only enqueues where the budget actually shortened
 		 * the slice, i.e. the task will be preempted early. */
 		if (slice < DEFAULT_SLICE_NS)
-			__sync_fetch_and_add(&s->budget_capped, 1);
+			s->budget_capped++;
+		if (!found)
+			s->defaults++;
 	}
 }
 
@@ -191,9 +264,12 @@ void BPF_STRUCT_OPS(k8s_running, struct task_struct *p)
 
 void BPF_STRUCT_OPS(k8s_stopping, struct task_struct *p, bool runnable)
 {
-	struct task_params tp = get_task_params((u32)p->tgid);
-	u64 slice = task_slice(&tp);
-	u64 used = slice - p->scx.slice; /* consumed part of the slice */
+	struct task_params tp;
+	u64 slice, used;
+
+	lookup_task_params(p, &tp);
+	slice = task_slice(&tp);
+	used = slice - p->scx.slice; /* consumed part of the slice */
 
 	if (used > slice)
 		used = slice; /* guard against underflow */

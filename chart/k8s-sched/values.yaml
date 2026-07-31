@@ -1,5 +1,3 @@
-replicaCount: 1
-
 image:
   repository: ghcr.io/fengrru/k8s-sched
   tag: latest
@@ -34,6 +32,11 @@ daemonSet:
   # without it the agent falls back to scanning /proc.
   hostCgroupPath: /host/sys/fs/cgroup
 
+  # Grace period for the agent pod. Must exceed the agent's 15s
+  # SIGTERM handover window (see templates/daemonset.yaml) so a
+  # rolling upgrade swaps schedulers without an EEVDF gap.
+  terminationGracePeriodSeconds: 30
+
 # Pod-level scheduling parameters can be set via annotations:
 #   scheduling.fengrru.dev/importance: "95"
 #   scheduling.fengrru.dev/weight: "9500"
@@ -42,6 +45,8 @@ daemonSet:
 # ServiceAccount for the agent. Needs:
 #   - get/list/watch pods (node-scoped)
 #   - get/list/watch schedulingpolicies (cluster-scoped)
+#   - patch schedulingpolicies/status (per-node matching pod counts)
+#   - create/patch events (policy errors as Kubernetes Events)
 serviceAccount:
   create: true
   name: k8s-sched
@@ -49,23 +54,25 @@ serviceAccount:
 rbac:
   create: true
 
-# Pod security context: must be privileged for BPF loading.
+# Pod security context: must run as root for BPF loading and
+# /proc, cgroup v2, and /sys/fs/bpf host mounts.
 podSecurityContext:
   runAsUser: 0
   runAsNonRoot: false
 
+# Container security context: privileged is required for loading BPF
+# struct_ops; it already implies all capabilities and escalation, so
+# explicit capability lists (and drop-all, which privileged ignores)
+# are redundant and confusing.
+#
+# For hardened clusters, replace `privileged: true` with a minimal
+# capability set. The minimum for sched_ext + map pinning is:
+#   capabilities:
+#     add: ["SYS_ADMIN", "BPF", "PERFMON"]
+# (SYS_ADMIN covers BPF map pinning under /sys/fs/bpf; BPF+PERFMON
+# cover struct_ops attach on 5.8+ kernels.)
 containerSecurityContext:
   privileged: true
-  allowPrivilegeEscalation: true
-  capabilities:
-    add:
-      - BPF
-      - SYS_ADMIN
-      - PERFMON
-      - NET_ADMIN
-      - SYS_RESOURCE
-    drop:
-      - ALL
 
 resources:
   limits:
@@ -88,16 +95,19 @@ metrics:
   port: 9090
   path: /metrics
 
-# ServiceMonitor for Prometheus Operator (optional)
+# ServiceMonitor for Prometheus Operator (optional).
+# Merge additional labels (e.g. release: prometheus) so the operator's
+# selector picks it up.
 serviceMonitor:
   enabled: false
   interval: 30s
+  labels: {}
 
 # Liveness probe: checks if the agent process is alive.
 livenessProbe:
   httpGet:
     path: /healthz
-    port: 9090
+    port: metrics
   initialDelaySeconds: 10
   periodSeconds: 30
   timeoutSeconds: 3
@@ -107,7 +117,7 @@ livenessProbe:
 readinessProbe:
   httpGet:
     path: /readyz
-    port: 9090
+    port: metrics
   initialDelaySeconds: 5
   periodSeconds: 10
   timeoutSeconds: 3

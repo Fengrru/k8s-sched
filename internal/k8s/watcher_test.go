@@ -30,10 +30,11 @@ func TestNewPodWatcher(t *testing.T) {
 }
 
 func TestHandlePodUpdate_NotRunning(t *testing.T) {
-	called := false
+	addCalled, deleteCalled := false, false
 	w := &PodWatcher{
-		log:   zap.NewNop(),
-		onAdd: func(pod *corev1.Pod) { called = true },
+		log:      zap.NewNop(),
+		onAdd:    func(pod *corev1.Pod) { addCalled = true },
+		onDelete: func(pod *corev1.Pod) { deleteCalled = true },
 	}
 
 	pending := &corev1.Pod{
@@ -43,8 +44,11 @@ func TestHandlePodUpdate_NotRunning(t *testing.T) {
 	}
 	w.handlePodUpdate(pending)
 
-	if called {
-		t.Error("should not trigger callback for non-Running pod")
+	if addCalled {
+		t.Error("should not trigger add callback for non-Running pod")
+	}
+	if deleteCalled {
+		t.Error("should not trigger delete callback for non-terminal pod")
 	}
 }
 
@@ -93,11 +97,12 @@ func TestPodWatcher_FieldSelector(t *testing.T) {
 }
 
 func TestHandlePodUpdate_Succeeded(t *testing.T) {
-	// Pods in Succeeded phase should NOT trigger callback.
-	called := false
+	// Terminal pods must release their BPF entries via onDelete.
+	addCalled, deleteCalled := false, false
 	w := &PodWatcher{
-		log:   zap.NewNop(),
-		onAdd: func(pod *corev1.Pod) { called = true },
+		log:      zap.NewNop(),
+		onAdd:    func(pod *corev1.Pod) { addCalled = true },
+		onDelete: func(pod *corev1.Pod) { deleteCalled = true },
 	}
 
 	succeeded := &corev1.Pod{
@@ -107,17 +112,21 @@ func TestHandlePodUpdate_Succeeded(t *testing.T) {
 	}
 	w.handlePodUpdate(succeeded)
 
-	if called {
-		t.Error("should not trigger callback for Succeeded pod")
+	if addCalled {
+		t.Error("should not trigger add callback for Succeeded pod")
+	}
+	if !deleteCalled {
+		t.Error("should trigger delete callback for Succeeded pod")
 	}
 }
 
 func TestHandlePodUpdate_Failed(t *testing.T) {
-	// Pods in Failed phase should NOT trigger callback.
-	called := false
+	// Terminal pods must release their BPF entries via onDelete.
+	addCalled, deleteCalled := false, false
 	w := &PodWatcher{
-		log:   zap.NewNop(),
-		onAdd: func(pod *corev1.Pod) { called = true },
+		log:      zap.NewNop(),
+		onAdd:    func(pod *corev1.Pod) { addCalled = true },
+		onDelete: func(pod *corev1.Pod) { deleteCalled = true },
 	}
 
 	failed := &corev1.Pod{
@@ -127,8 +136,50 @@ func TestHandlePodUpdate_Failed(t *testing.T) {
 	}
 	w.handlePodUpdate(failed)
 
-	if called {
-		t.Error("should not trigger callback for Failed pod")
+	if addCalled {
+		t.Error("should not trigger add callback for Failed pod")
+	}
+	if !deleteCalled {
+		t.Error("should trigger delete callback for Failed pod")
+	}
+}
+
+func TestPodRelevantFieldsChanged(t *testing.T) {
+	base := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels:      map[string]string{"app": "x"},
+			Annotations: map[string]string{"note": "a"},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{ContainerID: "docker://aaa"},
+			},
+		},
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(p *corev1.Pod)
+		want   bool
+	}{
+		{"identical", func(p *corev1.Pod) {}, false},
+		{"phase", func(p *corev1.Pod) { p.Status.Phase = corev1.PodSucceeded }, true},
+		{"labels", func(p *corev1.Pod) { p.Labels["app"] = "y" }, true},
+		{"annotations", func(p *corev1.Pod) { p.Annotations["note"] = "b" }, true},
+		{"container-id", func(p *corev1.Pod) { p.Status.ContainerStatuses[0].ContainerID = "docker://bbb" }, true},
+		{"restart-count-only", func(p *corev1.Pod) { p.Status.ContainerStatuses[0].RestartCount = 5 }, false},
+		{"resource-version-only", func(p *corev1.Pod) { p.ResourceVersion = "999" }, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clone := base.DeepCopy()
+			tt.mutate(clone)
+			if got := podRelevantFieldsChanged(base, clone); got != tt.want {
+				t.Errorf("podRelevantFieldsChanged() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

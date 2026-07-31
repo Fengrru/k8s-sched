@@ -92,8 +92,8 @@ func TestPIDResolution(t *testing.T) {
 		t.Skip("skipping PID test in short mode")
 	}
 
-	// Create a mock pod with a known UID pattern.
-	// In real E2E, this would match actual running containers.
+	// A bogus UID that no real pod can have: resolution must return
+	// nothing rather than panicking or matching unrelated pods.
 	mockPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			UID: "00000000-0000-0000-0000-000000000000",
@@ -102,6 +102,15 @@ func TestPIDResolution(t *testing.T) {
 
 	pids := maps.ResolvePodPIDs(mockPod)
 	t.Logf("Resolved %d PIDs for mock pod", len(pids))
+	if len(pids) != 0 {
+		t.Errorf("bogus UID resolved to %d PIDs, want 0", len(pids))
+	}
+
+	// Same for the cgroup-ID path.
+	cgids := maps.ResolvePodCgroupIDs(mockPod)
+	if len(cgids) != 0 {
+		t.Errorf("bogus UID resolved to %d cgroup IDs, want 0", len(cgids))
+	}
 }
 
 // TestSchedulingAnnotationParsing validates annotation-to-param conversion.

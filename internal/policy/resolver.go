@@ -44,6 +44,11 @@ type Resolver struct {
 	nodeName  string
 	celCache  *cel.Cache
 
+	// onPolicyError is invoked when a policy fails to compile or
+	// evaluate its CEL condition, so callers can surface Kubernetes
+	// Events without the resolver depending on a cluster client.
+	onPolicyError func(policyName string, err error)
+
 	mu          sync.RWMutex
 	policies    map[string]*v1alpha1.SchedulingPolicy
 	matchedPods map[string]map[string]int32 // policy name -> set of pod UIDs
@@ -68,8 +73,8 @@ func NewResolver(
 	}
 }
 
-// schedulingPolicyGVR is the GroupVersionResource for the SchedulingPolicy CRD.
-var schedulingPolicyGVR = schema.GroupVersionResource{
+// SchedulingPolicyGVR is the GroupVersionResource for the SchedulingPolicy CRD.
+var SchedulingPolicyGVR = schema.GroupVersionResource{
 	Group:    "scheduling.fengrru.dev",
 	Version:  "v1alpha1",
 	Resource: "schedulingpolicies",
@@ -90,7 +95,7 @@ func (r *Resolver) Start(stopCh <-chan struct{}) {
 		dynClient, 5*time.Minute, metav1.NamespaceAll, nil,
 	)
 
-	informer := factory.ForResource(schedulingPolicyGVR).Informer()
+	informer := factory.ForResource(SchedulingPolicyGVR).Informer()
 	if _, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			policy := r.unstructuredToPolicy(obj)
@@ -260,24 +265,53 @@ func (r *Resolver) refreshPolicies() {
 	}
 }
 
+// SetPolicyErrorHandler registers a callback invoked whenever a policy's
+// CEL condition fails to compile or evaluate.
+func (r *Resolver) SetPolicyErrorHandler(h func(policyName string, err error)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onPolicyError = h
+}
+
+// qosDefaultWeight maps a pod's QoS class to the weight applied when
+// no matching policy and no annotation sets one. This gives
+// best-effort work a low priority and guaranteed work the default
+// priority with zero configuration — the flat vtime pool always
+// favours latency-critical pods.
+func qosDefaultWeight(qos corev1.PodQOSClass) uint64 {
+	switch qos {
+	case corev1.PodQOSGuaranteed:
+		return 1000
+	case corev1.PodQOSBurstable:
+		return 800
+	case corev1.PodQOSBestEffort:
+		return 200
+	default:
+		return 1000
+	}
+}
+
 // Resolve returns the combined scheduling parameters for a pod.
 // It merges all matching SchedulingPolicy CRDs with pod annotation
 // overrides. Annotations always take precedence over CRD params.
 //
 // Resolution order:
-//  1. All matching SchedulingPolicy CRDs: max weight wins, max budget wins
+//  1. All matching SchedulingPolicy CRDs: max weight wins, max budget wins.
+//     Policies may set weights below the default (e.g. 200) to deprioritize;
+//     the default only applies when no matching policy sets a weight.
 //  2. Pod annotation (weight / budget-microseconds / importance)
-//  3. Default values (weight=1000, budget=0)
+//  3. QoS-based default: Guaranteed=1000, Burstable=800, BestEffort=200
 func (r *Resolver) Resolve(pod *corev1.Pod) Params {
-	result := Params{Weight: 1000}
+	result := Params{Weight: qosDefaultWeight(pod.Status.QOSClass)}
 
 	policies := r.getMatchingPolicies(pod)
 	matchedNames := make([]string, 0, len(policies))
+	var policyWeight uint64
 	for _, policy := range policies {
 		matchedNames = append(matchedNames, policy.Name)
 		if policy.Spec.Weight > 0 {
-			if uint64(policy.Spec.Weight) > result.Weight {
-				result.Weight = uint64(policy.Spec.Weight)
+			if uint64(policy.Spec.Weight) > policyWeight {
+				policyWeight = uint64(policy.Spec.Weight)
 			}
 		}
 		if policy.Spec.BudgetMicroseconds > 0 {
@@ -286,6 +320,11 @@ func (r *Resolver) Resolve(pod *corev1.Pod) Params {
 				result.BudgetNs = budgetNs
 			}
 		}
+	}
+	// A policy-set weight replaces the default outright, so policies can
+	// lower priority below 1000, not only raise it.
+	if policyWeight > 0 {
+		result.Weight = policyWeight
 	}
 
 	if pod.Annotations != nil {
@@ -382,16 +421,22 @@ func (r *Resolver) celConditionPasses(policy *v1alpha1.SchedulingPolicy, pod *co
 
 	vars := map[string]interface{}{
 		"signal": map[string]interface{}{
-			"podName":       pod.Name,
-			"podNamespace":  pod.Namespace,
-			"podCPURequest": cpuRequest,
-			"podCPULimit":   cpuLimit,
-			"nodeName":      pod.Spec.NodeName,
+			"podName":          pod.Name,
+			"podNamespace":     pod.Namespace,
+			"podUID":           string(pod.UID),
+			"podQOSClass":      string(pod.Status.QOSClass),
+			"podPriorityClass": pod.Spec.PriorityClassName,
+			"podRestartCount":  totalRestarts(pod),
+			"podCPURequest":    cpuRequest,
+			"podCPULimit":      cpuLimit,
+			"nodeName":         pod.Spec.NodeName,
 		},
 		"context": map[string]interface{}{
 			"policyName": policy.Name,
-			"weight":     policy.Spec.Weight,
-			"budgetUs":   policy.Spec.BudgetMicroseconds,
+			// Exposed as doubles so expressions can mix them with
+			// fractional literals (CEL has no int*double overload).
+			"weight":   float64(policy.Spec.Weight),
+			"budgetUs": float64(policy.Spec.BudgetMicroseconds),
 		},
 	}
 
@@ -403,10 +448,22 @@ func (r *Resolver) celConditionPasses(policy *v1alpha1.SchedulingPolicy, pod *co
 			zap.String("expr", policy.Spec.CELCondition),
 			zap.Error(err),
 		)
+		if r.onPolicyError != nil {
+			r.onPolicyError(policy.Name, err)
+		}
 		return false
 	}
 
 	return ok
+}
+
+// totalRestarts sums RestartCount across all container statuses.
+func totalRestarts(pod *corev1.Pod) int64 {
+	var n int64
+	for i := range pod.Status.ContainerStatuses {
+		n += int64(pod.Status.ContainerStatuses[i].RestartCount)
+	}
+	return n
 }
 
 // aggregatePodCPU sums CPU requests and limits across all containers.
@@ -447,4 +504,17 @@ func (r *Resolver) PolicyNames() []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+// PolicyGeneration returns the generation of a cached policy, or false
+// if it is not present.
+func (r *Resolver) PolicyGeneration(name string) (int64, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	p, ok := r.policies[name]
+	if !ok {
+		return 0, false
+	}
+	return p.Generation, true
 }

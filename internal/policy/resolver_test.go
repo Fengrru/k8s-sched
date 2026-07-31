@@ -359,6 +359,79 @@ func TestResolve_NoPoliciesNoAnnotations(t *testing.T) {
 	}
 }
 
+func TestResolve_PolicyDeprioritizes(t *testing.T) {
+	// A policy weight below the 1000 default must lower the pod's
+	// priority (not be swallowed by the max-with-default merge).
+	r := NewResolver(nil, nil, "node-1")
+
+	r.mu.Lock()
+	r.policies["batch"] = &v1alpha1.SchedulingPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "batch"},
+		Spec: v1alpha1.SchedulingPolicySpec{
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"tier": "batch"}},
+			Weight:      200,
+		},
+	}
+	r.mu.Unlock()
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"tier": "batch"}},
+	}
+
+	params := r.Resolve(pod)
+	if params.Weight != 200 {
+		t.Errorf("Resolve() weight = %d, want 200 (policy deprioritizes below default)", params.Weight)
+	}
+}
+
+func TestResolve_PolicyZeroWeightKeepsDefault(t *testing.T) {
+	// weight unset (0) means "no opinion": the default 1000 applies.
+	r := NewResolver(nil, nil, "node-1")
+
+	r.mu.Lock()
+	r.policies["no-weight"] = &v1alpha1.SchedulingPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "no-weight"},
+		Spec: v1alpha1.SchedulingPolicySpec{
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "x"}},
+		},
+	}
+	r.mu.Unlock()
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "x"}},
+	}
+
+	params := r.Resolve(pod)
+	if params.Weight != 1000 {
+		t.Errorf("Resolve() weight = %d, want 1000 (unset policy weight)", params.Weight)
+	}
+}
+
+func TestCELCondition_DoubleContext(t *testing.T) {
+	// weight/budgetUs are exposed as doubles; the documented example
+	// mixes them with a fractional literal (CEL has no int*double
+	// overload, so this would fail to compile for int64 vars).
+	r := NewResolver(nil, nil, "node-1")
+
+	policy := &v1alpha1.SchedulingPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "budget-gated"},
+		Spec: v1alpha1.SchedulingPolicySpec{
+			CELCondition:       "context.budgetUs * 0.001 > 1.5",
+			BudgetMicroseconds: 2000, // 2ms -> 2.0ms > 1.5ms
+		},
+	}
+
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "ns"}}
+	if !r.celConditionPasses(policy, pod) {
+		t.Error("CEL double arithmetic should pass: 2000 * 0.001 = 2.0 > 1.5")
+	}
+
+	policy.Spec.BudgetMicroseconds = 1000 // 1.0 > 1.5 -> false
+	if r.celConditionPasses(policy, pod) {
+		t.Error("CEL double arithmetic should fail: 1000 * 0.001 = 1.0 <= 1.5")
+	}
+}
+
 func TestActivePodCount(t *testing.T) {
 	r := NewResolver(nil, nil, "node-1")
 
@@ -387,5 +460,137 @@ func TestActivePodCount(t *testing.T) {
 	r.Resolve(pod)
 	if count := r.ActivePodCount("existing"); count != 1 {
 		t.Errorf("ActivePodCount after resolving pod = %d, want 1", count)
+	}
+}
+
+func TestResolve_QoSDefaults(t *testing.T) {
+	// With no policy and no annotation, the pod's QoS class picks the
+	// weight: guaranteed work keeps the default, best-effort work is
+	// deprioritized. Zero-config mixed workloads.
+	tests := []struct {
+		name string
+		qos  corev1.PodQOSClass
+		want uint64
+	}{
+		{"guaranteed", corev1.PodQOSGuaranteed, 1000},
+		{"burstable", corev1.PodQOSBurstable, 800},
+		{"best-effort", corev1.PodQOSBestEffort, 200},
+		{"unset", "", 1000},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := NewResolver(nil, nil, "node-1")
+			pod := &corev1.Pod{
+				Status: corev1.PodStatus{QOSClass: tt.qos},
+			}
+			if got := r.Resolve(pod).Weight; got != tt.want {
+				t.Errorf("Resolve() weight = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolve_QoSPolicyOverridesWeight(t *testing.T) {
+	// Explicit policy weights beat the QoS default in both directions:
+	// raising a best-effort pod, and deprioritizing a guaranteed one.
+	r := NewResolver(nil, nil, "node-1")
+	r.mu.Lock()
+	r.policies["raise"] = &v1alpha1.SchedulingPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "raise"},
+		Spec: v1alpha1.SchedulingPolicySpec{
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "a"}},
+			Weight:      9000,
+		},
+	}
+	r.policies["lower"] = &v1alpha1.SchedulingPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "lower"},
+		Spec: v1alpha1.SchedulingPolicySpec{
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "b"}},
+			Weight:      300,
+		},
+	}
+	r.mu.Unlock()
+
+	raised := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "u1", Labels: map[string]string{"app": "a"}},
+		Status:     corev1.PodStatus{QOSClass: corev1.PodQOSBestEffort},
+	}
+	if got := r.Resolve(raised).Weight; got != 9000 {
+		t.Errorf("best-effort raised by policy = %d, want 9000", got)
+	}
+
+	lowered := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "u2", Labels: map[string]string{"app": "b"}},
+		Status:     corev1.PodStatus{QOSClass: corev1.PodQOSGuaranteed},
+	}
+	if got := r.Resolve(lowered).Weight; got != 300 {
+		t.Errorf("guaranteed lowered by policy = %d, want 300", got)
+	}
+}
+
+func TestCELCondition_ExtendedSignalVars(t *testing.T) {
+	r := NewResolver(nil, nil, "node-1")
+
+	policy := &v1alpha1.SchedulingPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "restart-gated"},
+		Spec: v1alpha1.SchedulingPolicySpec{
+			CELCondition: "signal.podRestartCount >= 2 && signal.podQOSClass == 'BestEffort' " +
+				"&& signal.podPriorityClass == 'batch' && signal.podUID != ''",
+		},
+	}
+
+	crashLooping := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", UID: "uid-1"},
+		Spec: corev1.PodSpec{
+			PriorityClassName: "batch",
+		},
+		Status: corev1.PodStatus{
+			QOSClass: corev1.PodQOSBestEffort,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{RestartCount: 1},
+				{RestartCount: 1},
+			},
+		},
+	}
+	if !r.celConditionPasses(policy, crashLooping) {
+		t.Error("CEL extended vars should pass for crash-looping best-effort pod")
+	}
+
+	healthy := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p2", UID: "uid-2"},
+		Status:     corev1.PodStatus{QOSClass: corev1.PodQOSGuaranteed},
+	}
+	if r.celConditionPasses(policy, healthy) {
+		t.Error("CEL extended vars should fail for healthy guaranteed pod")
+	}
+}
+
+func TestSetPolicyErrorHandler(t *testing.T) {
+	r := NewResolver(nil, nil, "node-1")
+
+	var gotPolicy string
+	var gotErr error
+	r.SetPolicyErrorHandler(func(name string, err error) {
+		gotPolicy = name
+		gotErr = err
+	})
+
+	policy := &v1alpha1.SchedulingPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "broken"},
+		Spec: v1alpha1.SchedulingPolicySpec{
+			CELCondition: "this is not CEL",
+		},
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p"}}
+
+	if r.celConditionPasses(policy, pod) {
+		t.Error("invalid CEL must not pass")
+	}
+	if gotPolicy != "broken" {
+		t.Errorf("error handler policy = %q, want %q", gotPolicy, "broken")
+	}
+	if gotErr == nil {
+		t.Error("error handler should receive the CEL error")
 	}
 }

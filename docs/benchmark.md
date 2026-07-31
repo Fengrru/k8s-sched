@@ -100,7 +100,8 @@ set_weight <antagonist-uid> 20
 
 Sanity checks before trusting a run (arm C):
 `bpftool map dump pinned /sys/fs/bpf/k8s-sched/task_params` must contain
-the tgids of both pods with the expected weights, and
+the tgids of both pods with the expected weights (equivalently:
+`curl localhost:9090/debug/params` on the agent), and
 `cat /sys/kernel/sched_ext/root/ops` must report `k8s_sched`.
 
 ## Success criteria
@@ -118,3 +119,28 @@ Publish per-arm raw schbench output plus a summary table
 (arm x {p50, p99, p99.9, antagonist ops/s}) and the exact kernel version,
 CPU model, SMT state, and image digests. A result that cannot be
 reproduced from this file alone does not count.
+
+## Quick benchmark (automated, inside a VM)
+
+For a fast, reproducible EEVDF-vs-k8s-sched comparison without a
+physical bench node, run `make vm-bench` (same prerequisites as
+`make vm-smoke`): it boots a sched_ext kernel VM, compiles the BPF
+scheduler against the running kernel, then runs the same schbench +
+stress-ng workload twice — once on the kernel-default EEVDF and once
+with k8s-sched attached:
+
+```bash
+make vm-bench            # or: vng --rw -r v6.14 -- bash hack/vm-bench.sh
+```
+
+The script prints percentile tables side by side. Caveats: a VM is not
+noisy-neighbor-free (the host shares the CPU), and `-m 4 -t 8` is
+smaller than the full experiment above. Treat VM numbers as
+*sanity* results — publish the bare-metal experiment for real claims,
+but always include the VM run plus kernel version in any report.
+
+Tuning:
+
+```bash
+SCHED_BENCH_ARGS="-m 2 -t 8 -r 30" STRESS_ARGS="-c 2" make vm-bench
+```

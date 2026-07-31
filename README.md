@@ -60,8 +60,10 @@ Anything that touches the kernel scheduler must answer this first:
 |---|---|
 | BPF scheduler misbehaves (stall, runaway) | Kernel **watchdog auto-ejects it** and falls back to EEVDF within seconds — the node keeps running |
 | Agent crashes / is OOM-killed | struct_ops link closes → kernel **instantly reverts** to the default scheduler |
-| Kernel lacks sched_ext | Agent starts in **observe-only mode**: watches pods, exports metrics, schedules nothing |
+| Kernel lacks sched_ext | Agent starts in **observe-only mode**: watches pods, exports metrics, schedules nothing (`/readyz` returns 503, `k8s_sched_scheduler_loaded` stays 0) |
 | Human wants out *now* | `helm uninstall`, or `sysrq-S` to kick out any sched_ext scheduler from the console |
+| Rolling upgrade of the DaemonSet | Old agent keeps the scheduler attached for 15s after SIGTERM while the replacement retries the attach (handover) — the node never falls back to EEVDF. Foreign schedulers are respected: the agent goes observe-only instead of fighting for the CPU |
+| Policy misconfigured (bad CEL, unparseable weight) | Agent emits a `Warning` Kubernetes Event on the policy/pod (`PolicyCelError` / `PodResolveError`), the policy is skipped, and the pod keeps its default weight — nothing crashes
 
 This is the core sched_ext safety contract: a buggy BPF scheduler can degrade scheduling for a few seconds — it cannot panic or wedge the kernel.
 
@@ -76,8 +78,8 @@ flowchart TB
         subgraph agent ["Go Agent · userspace · control plane"]
             direction TB
             resolver["PolicyResolver<br/>CRDs + CEL + annotations"]
-            pids["resolvePodPIDs()<br/>cgroup v2 cgroup.procs<br/><i>fallback: /proc scan</i>"]
-            map[("BPF map: task_params<br/>tgid → weight, budget_ns")]
+            pids["resolvePodCgroupIDs()<br/>cgroup v2 leaf cgroups<br/><i>fallback: /proc scan + PID map</i>"]
+            map[("BPF maps: cgroup_params + task_params<br/>cgroup ID / tgid → weight, budget_ns")]
             resolver --> pids --> map
         end
         subgraph bpf ["BPF Scheduler · in-kernel · hot path"]
@@ -110,7 +112,7 @@ Budget enforcement: slice = min(DEFAULT_SLICE, budget_ns)
   budget=2ms → task is preempted after at most 2ms per slice
 ```
 
-Params are keyed by **tgid** (thread-group id), so every thread of a multi-threaded process inherits its Pod's weight and budget.
+Params are keyed by **cgroup ID** (the pod's cgroup v2 directory inode), with a PID-keyed fallback map for environments where cgroup resolution fails. Keying by cgroup means processes spawned after pod start — and every thread of every process in the pod — inherit the pod's weight and budget automatically, with no risk of PID reuse collisions.
 
 ## Quick Start
 
@@ -154,9 +156,35 @@ spec:
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `podSelector` | LabelSelector | `{}` | Pods to apply this policy to |
-| `weight` | int | 1000 | Scheduling weight (1–10000) |
+| `podSelector` | LabelSelector | `{}` (match all) | Pods to apply this policy to |
+| `weight` | int | 1000 (when unset) | Scheduling weight (1–10000); below 1000 deprioritizes |
 | `budgetMicroseconds` | int | 0 | Max CPU per slice; 0 = no cap. Only values below the 5ms default slice have an effect |
+| `celCondition` | string | "" | CEL expression gating the policy (see [CEL variables](#cel-variables)) |
+
+When no policy and no annotation set a weight, the pod's **QoS class picks the default**: Guaranteed → 1000, Burstable → 800, BestEffort → 200. Best-effort batch work is deprioritized with zero configuration; an explicit policy weight always wins.
+
+Each node's agent writes its matching pod counts into `status.nodeStatuses` (node → policy → count) every 15s — `kubectl get sp latency-critical -o yaml` shows exactly where the policy is taking effect.
+
+### CEL variables
+
+`spec.celCondition` is evaluated per pod with:
+
+| Variable | Type | Meaning |
+|---|---|---|
+| `signal.podName` / `signal.podNamespace` / `signal.podUID` | string | Pod identity |
+| `signal.podQOSClass` | string | `Guaranteed` / `Burstable` / `BestEffort` |
+| `signal.podPriorityClass` | string | `priorityClassName`, empty when unset |
+| `signal.podRestartCount` | int | Total container restarts (crash-loop detection) |
+| `signal.podCPURequest` / `signal.podCPULimit` | double | Total across containers, in cores |
+| `signal.nodeName` | string | Node the pod runs on |
+| `context.policyName` | string | This policy's name |
+| `context.weight` / `context.budgetUs` | double | This policy's own values (0 when unset) |
+
+Example — deprioritize crash-looping best-effort jobs:
+
+```yaml
+celCondition: "signal.podQOSClass == 'BestEffort' && signal.podRestartCount >= 3"
+```
 
 ## Pod Annotations
 
@@ -170,16 +198,27 @@ spec:
 
 ## Observability
 
-The agent exposes Prometheus metrics on `:9090/metrics`, plus `/healthz` and `/readyz`:
+The agent exposes Prometheus metrics on `:9090/metrics`, plus `/healthz` (liveness: always 200 while the process runs) and `/readyz` (readiness: 200 only when the BPF scheduler is attached):
 
 | Metric | Type | Meaning |
 |---|---|---|
 | `k8s_sched_enqueues_total` | counter | Task enqueues seen by the in-kernel scheduler (liveness of the hot path) |
+| `k8s_sched_local_dispatches_total` | counter | Dispatches to a local idle CPU (bypasses the shared queue) |
 | `k8s_sched_budget_capped_total` | counter | Enqueues where a budget shortened the slice (is your budget actually biting?) |
-| `k8s_sched_params_mapped` | gauge | Pods with parameters currently written to the BPF map |
+| `k8s_sched_defaults_total` | counter | Enqueues with no matching params — they got the default weight (are your pods being resolved?) |
+| `k8s_sched_scheduler_loaded` | gauge | 1 when the BPF scheduler is attached, 0 in observe-only mode |
+| `k8s_sched_params_mapped` | gauge | Pods with parameters currently written to the BPF maps |
 | `k8s_sched_active_policies` | gauge | SchedulingPolicy CRDs currently active |
+| `k8s_sched_attach_retries_total` | counter | Attach retries during rolling-upgrade handover (0 = clean swaps) |
+| `k8s_sched_status_writebacks_total` | counter | Successful `SchedulingPolicy.status` write-backs |
 
-Rule of thumb: `enqueues_total` flat-lining while pods run means the scheduler isn't attached; `params_mapped` at 0 with annotated pods means PID resolution is failing (check `hostPID` and cgroup mounts).
+**Debug endpoints** (same port, JSON): `/debug/params` dumps the live BPF parameter maps (cgroup ID → weight/budget), `/debug/pods` shows the agent's bookkeeping (pod UID → cgroup IDs / PIDs). `kubectl exec` replaces `bpftool` for inspection:
+
+```bash
+kubectl -n kube-system exec ds/k8s-sched -- curl -s localhost:9090/debug/params
+```
+
+Rule of thumb: `enqueues_total` flat-lining while pods run means the scheduler isn't attached; `params_mapped` at 0 with annotated pods means cgroup/PID resolution is failing (check `hostPID` and cgroup mounts); `defaults_total` climbing with annotated pods means the same.
 
 ## FAQ
 
@@ -192,11 +231,22 @@ Four things, honestly ranked:
 
 Whether these matter for *your* workload is an empirical question — see the [benchmark methodology](docs/benchmark.md). If `cpu.weight` covers your needs, use `cpu.weight`.
 
+## Use cases
+
+**1. Latency-critical + batch co-location (zero config).** Deploy on a mixed node; BestEffort pods automatically get weight 200 while Guaranteed work keeps 1000 — a 5:1 kernel-level head start, no annotations needed.
+
+**2. A policy that means what it says.** `SchedulingPolicy` with `podSelector` + `weight: 9000` is a single declarative object that *any* pod with the label receives — the number is applied in-kernel, survives pod restarts, and covers every thread of every process (cgroup-keyed). `status.nodeStatuses` tells you it is live on each node.
+
+**3. Dynamic deprioritization via CEL.** Gate a policy on runtime state — `signal.podRestartCount >= 3` (crash-looping pods lose priority), `signal.podQOSClass == 'BestEffort' && signal.podCPURequest > 4` (fat batch jobs). Change the expression; the agent re-evaluates on pod updates.
+
+**4. Slice budget for tail latency.** A latency-critical service sharing a node with a noisy neighbour: cap the neighbour's slice (`budgetMicroseconds: 1000`), so it is preempted every 1ms instead of hogging a 5ms slice — the latency service gets on-CPU sooner.
+
+
 **vs. Koordinator / Alibaba Group Identity?**
 Similar goal (CPU QoS tiers), different trade-off: Group Identity needs a vendor-patched kernel (Alibaba Cloud Linux). k8s-sched runs on any mainline 6.12+ kernel.
 
-**Why key by tgid instead of pid?**
-The kernel's `p->pid` is a *thread* id. Keying by `p->tgid` means all threads of a process — and therefore all processes listed in the pod's `cgroup.procs` — inherit the pod's parameters. Verify on a live node: `bpftool map dump pinned /sys/fs/bpf/k8s-sched/task_params`.
+**Why key by cgroup ID instead of PID?**
+PIDs are ephemeral: they get reused, and a process spawned *after* pod start (a fork/exec in an init container, a shell in a sidecar) would never match a PID-keyed entry — the fast path would silently miss it. The pod's cgroup exists for the pod's whole lifetime, every thread and every new process in it is covered automatically, and `fork()` can't outrun it. The kernel reads the ID via `scx_bpf_task_cgroup()`; the agent resolves it from the cgroup v2 directory inode. Verify on a live node: `curl localhost:9090/debug/params` (or `bpftool map dump pinned /sys/fs/bpf/k8s-sched/cgroup_params`).
 
 **Can a low-weight pod starve?**
 No. The wakeup clamp (`vtime = max(vtime, vtime_now - slice)`) bounds how far behind any task can fall; everything eventually runs. Weight shifts proportions, it doesn't gate execution.
@@ -227,11 +277,13 @@ apt install clang bpftool golang-go
 make generate-vmlinux  # vmlinux.h from the running kernel's BTF
 make generate-ebpf     # BPF C → .o
 make build             # Go binary → bin/agent
+make manifests         # CRD from api/v1alpha1 markers — needs controller-gen@v0.17.3 (version pinned in CI)
 
 # Test
 make test              # unit + vtime math (any OS)
 make test-smoke        # load+attach+schedule on the current kernel (root, sched_ext)
 make vm-smoke          # same, inside a virtme-ng VM — no special host kernel needed
+make vm-bench          # EEVDF vs k8s-sched benchmark inside the same VM (schbench + stress-ng)
 
 # Docker
 docker build -t k8s-sched:latest .
@@ -256,15 +308,12 @@ Honest list, alpha software:
 - **Single flat scheduling pool** — no cgroup-hierarchy awareness, no NUMA/LLC-aware dispatch yet; best suited to single-socket nodes.
 - **Budget caps a slice, it is not a latency guarantee** — a capped task still waits in the vtime queue like everyone else.
 - **Global DSQ** — one shared dispatch queue per node; very high core counts will see contention.
-- **Stats counters are global** (per-CPU map planned), so the stats hot path has cross-CPU cache-line traffic.
-- **Not yet benchmarked against `cpu.weight`** — see [docs/benchmark.md](docs/benchmark.md); claims above are architectural, not yet empirical.
+- **Not yet benchmarked against `cpu.weight`** — see [docs/benchmark.md](docs/benchmark.md); claims above are architectural, not yet empirical. `make vm-bench` gets you a VM-based sanity run in minutes.
 
 ## Roadmap
 
 - [ ] Publish three-arm benchmark results (EEVDF / `cpu.weight` / k8s-sched)
 - [ ] Strict-priority tier above the weighted pool
-- [ ] Per-CPU stats map
-- [ ] `SchedulingPolicy.status` writeback (matched pod counts)
 - [ ] NUMA/LLC-aware dispatch queues
 
 ## License

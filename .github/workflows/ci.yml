@@ -54,14 +54,20 @@ jobs:
   # via virtme-ng, then: dumps vmlinux.h from its BTF, compiles the BPF
   # scheduler against it, and runs a load+attach+schedule smoke test.
   # This is the only place the BPF C code gets truly verified in CI.
+  # The kernel matrix guards against sched_ext API drift across the
+  # supported range (v6.12 = first sched_ext release, v6.15 = current).
   bpf-verify:
-    name: BPF Verify (sched_ext VM)
+    name: BPF Verify (${{ matrix.kernel }})
     runs-on: ubuntu-24.04
     needs: lint-and-test
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: [v6.12, v6.13, v6.14, v6.15]
     env:
       # Ubuntu mainline kernel with CONFIG_SCHED_CLASS_EXT=y.
-      SCX_KERNEL: v6.14
+      SCX_KERNEL: ${{ matrix.kernel }}
       BPFTOOL_VERSION: v7.5.0
     steps:
       - uses: actions/checkout@v7
@@ -97,10 +103,56 @@ jobs:
       - name: Upload BPF artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: bpf-${{ github.sha }}
+          name: bpf-${{ github.sha }}-${{ matrix.kernel }}
           path: |
             bpf/vmlinux.h
             bpf/k8s_sched.bpf.o
+
+  chart-lint:
+    name: Helm Chart Lint
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: helm lint
+        run: helm lint chart/k8s-sched
+
+      - name: helm template (render sanity check)
+        run: helm template k8s-sched chart/k8s-sched --namespace kube-system > /dev/null
+
+  # Regenerates the CRD from the kubebuilder markers in api/v1alpha1 and
+  # fails if the committed YAML drifts (descriptions, defaults, schema).
+  # Keep the controller-gen version in sync with the one used locally
+  # for `make manifests` (see Makefile).
+  manifests-check:
+    name: CRD Manifests Check
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Install controller-gen (pinned)
+        run: go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.17.3
+
+      - name: Regenerate CRD and check for drift
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          make manifests
+          git diff --exit-code -- config/crd/
+
+      - name: Show drift if any
+        if: failure()
+        run: git diff -- config/crd/
 
   build:
     name: Build
@@ -131,11 +183,12 @@ jobs:
 
       # vmlinux.h generated against a real sched_ext kernel by the
       # bpf-verify job — NOT the runner kernel, which lacks sched_ext
-      # BTF types and would produce a broken BPF object.
+      # BTF types and would produce a broken BPF object. The v6.14
+      # matrix entry is the project's primary target kernel.
       - name: Download vmlinux.h from bpf-verify
         uses: actions/download-artifact@v8
         with:
-          name: bpf-${{ github.sha }}
+          name: bpf-${{ github.sha }}-v6.14
           path: bpf/
 
       - name: Set up Docker Buildx

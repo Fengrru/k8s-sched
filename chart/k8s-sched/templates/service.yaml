@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "k8s-sched.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "k8s-sched.labels" . | nindent 4 }}
+spec:
+  # Headless: the DaemonSet has one pod per node, so expose every pod
+  # as an endpoint for ServiceMonitor discovery instead of load-balancing.
+  clusterIP: None
+  # Keep observe-only (degraded) nodes scrapable: their readyz is 503,
+  # which would otherwise drop them from the Endpoints object.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "k8s-sched.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+      protocol: TCP

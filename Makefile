@@ -4,8 +4,8 @@
 
 # ---- Build targets ----
 .PHONY: all build generate generate-ebpf generate-vmlinux manifests
-.PHONY: test test-unit test-vtime test-all test-linux test-smoke vm-smoke bench
-.PHONY: fmt vet lint clean docker-build help
+.PHONY: test test-unit test-vtime test-all test-linux test-smoke vm-smoke bench vm-bench
+.PHONY: fmt vet lint clean docker-build helm-lint helm-template helm-package helm-push help
 
 all: generate build
 
@@ -25,6 +25,10 @@ generate-vmlinux:
 	bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h
 
 # Generate CRD manifests
+# Requires controller-gen on PATH. Version is pinned in CI
+# (manifests-check job: sigs.k8s.io/controller-tools/cmd/controller-gen@v0.17.3);
+# install the same version locally to avoid drift:
+#   go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.17.3
 manifests:
 	controller-gen crd paths="./api/v1alpha1" output:crd:artifacts:config=config/crd/bases
 
@@ -67,6 +71,12 @@ vm-smoke:
 bench:
 	go test -bench=. -benchmem -run=^$$ ./internal/...
 
+# End-to-end benchmark inside a sched_ext VM: kernel-default EEVDF vs
+# k8s-sched on the same kernel. Same prerequisites as vm-smoke.
+vm-bench:
+	go test -c -o bin/sched-smoke.test ./internal/sched/
+	vng --verbose --rw -r v6.14 -- bash hack/vm-bench.sh
+
 # ---- Quality ----
 fmt:
 	go fmt ./...
@@ -84,6 +94,23 @@ clean:
 # ---- Docker ----
 docker-build:
 	docker build -t ghcr.io/fengrru/k8s-sched:latest .
+
+# ---- Helm chart ----
+# Validate the chart renders without errors.
+helm-lint:
+	helm lint chart/k8s-sched
+
+# Render the chart to stdout (sanity check the templates).
+helm-template:
+	helm template k8s-sched chart/k8s-sched --namespace kube-system
+
+# Package the chart into bin/.
+helm-package:
+	helm package chart/k8s-sched -d bin/
+
+# Push the packaged chart to an OCI registry (default: ghcr.io/fengrru).
+helm-push: helm-package
+	helm push bin/k8s-sched-*.tgz oci://$(CHART_REGISTRY)
 
 # ---- Help ----
 help:
@@ -103,9 +130,14 @@ help:
 	@echo "  test-smoke     - real-kernel load+attach smoke test (root, sched_ext)"
 	@echo "  vm-smoke       - smoke test inside a sched_ext VM via virtme-ng"
 	@echo "  bench          - run benchmark tests"
+	@echo "  vm-bench       - EEVDF vs k8s-sched benchmark inside a sched_ext VM"
 	@echo ""
 	@echo "  fmt            - format code"
 	@echo "  vet            - run go vet"
 	@echo "  lint           - run golangci-lint"
 	@echo "  clean          - remove build artifacts"
 	@echo "  docker-build   - build Docker image"
+	@echo "  helm-lint      - lint the Helm chart"
+	@echo "  helm-template  - render the Helm chart"
+	@echo "  helm-package   - package the chart into bin/"
+	@echo "  helm-push      - push the chart to an OCI registry (CHART_REGISTRY)"

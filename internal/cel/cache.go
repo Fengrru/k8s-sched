@@ -27,6 +27,10 @@ type Cache struct {
 	mu       sync.RWMutex
 	capacity int
 	entries  map[string]*cacheEntry
+	// inflight deduplicates concurrent compiles of the same expression
+	// (singleflight), so a thundering herd of updates doesn't compile
+	// the same source N times.
+	inflight map[string]*compileCall
 }
 
 type cacheEntry struct {
@@ -36,11 +40,20 @@ type cacheEntry struct {
 	program cel.Program
 }
 
+// compileCall is a single in-flight compile result shared by all
+// callers waiting on the same expression.
+type compileCall struct {
+	done chan struct{}
+	prog cel.Program
+	err  error
+}
+
 // NewCache creates a CEL program cache with the given capacity.
 func NewCache(capacity int) *Cache {
 	return &Cache{
 		capacity: capacity,
 		entries:  make(map[string]*cacheEntry, capacity),
+		inflight: make(map[string]*compileCall),
 	}
 }
 
@@ -66,17 +79,36 @@ func (c *Cache) getOrCompile(expr string) (cel.Program, error) {
 	}
 	c.mu.RUnlock()
 
-	// Slow path: compile with no lock held.
-	prog, err := c.compile(expr)
-	if err != nil {
-		return nil, fmt.Errorf("compile %q: %w", expr, err)
+	// Slow path: compile with no lock held. Concurrent callers for the
+	// same expression share one compile via the inflight map instead of
+	// each compiling their own copy.
+	c.mu.Lock()
+	if call, ok := c.inflight[expr]; ok {
+		c.mu.Unlock()
+		<-call.done
+		return call.prog, call.err
 	}
+	call := &compileCall{done: make(chan struct{})}
+	c.inflight[expr] = call
+	c.mu.Unlock()
+
+	call.prog, call.err = c.compile(expr)
+	if call.err != nil {
+		call.err = fmt.Errorf("compile %q: %w", expr, call.err)
+	}
+	close(call.done)
 
 	// Acquire write lock to insert into cache.
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	delete(c.inflight, expr)
 
-	// Double-check: another goroutine may have compiled the same expr.
+	if call.err != nil {
+		return nil, call.err
+	}
+
+	// Double-check: another goroutine may have inserted the same expr
+	// while we were compiling.
 	if entry, ok := c.entries[expr]; ok {
 		entry.clock.Store(globalClock.Add(1))
 		return entry.program, nil
@@ -84,11 +116,11 @@ func (c *Cache) getOrCompile(expr string) (cel.Program, error) {
 
 	c.evictIfNeeded()
 
-	entry := &cacheEntry{program: prog}
+	entry := &cacheEntry{program: call.prog}
 	entry.clock.Store(globalClock.Add(1))
 	c.entries[expr] = entry
 
-	return prog, nil
+	return call.prog, nil
 }
 
 func (c *Cache) runProgram(prog cel.Program, vars map[string]interface{}) (bool, error) {

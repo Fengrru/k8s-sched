@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/fengrru/k8s-sched/internal/sched"
 	"go.uber.org/zap"
@@ -37,14 +38,26 @@ func run() int {
 	}
 	defer func() { _ = log.Sync() }()
 
-	ctx, cancel := signal.NotifyContext(
-		context.Background(),
-		syscall.SIGINT,
-		syscall.SIGTERM,
-	)
+	// SIGTERM triggers a graceful handover: the agent keeps the
+	// sched_ext scheduler attached for a short window so a replacement
+	// pod (rolling upgrade) can attach before we exit, avoiding an
+	// EEVDF fallback gap. A second signal bails out immediately.
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		if sig == syscall.SIGTERM {
+			select {
+			case <-time.After(sched.HandoffDelay):
+			case <-sigCh:
+			}
+		}
+		cancel()
+	}()
 
-	agent, err := sched.NewAgent(ctx, log, nodeName, metricsAddr)
+	agent, err := sched.NewAgent(log, nodeName, metricsAddr)
 	if err != nil {
 		log.Error("failed to create agent", zap.Error(err))
 		return 1
