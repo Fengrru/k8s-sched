@@ -173,6 +173,9 @@ func (m *Maps) DumpParams() (ParamsDump, error) {
 	return dump, nil
 }
 
+// ReadStats returns the scheduler statistics aggregated across all
+// CPUs. Handles both per-CPU array maps (current BPF object) and the
+// plain array layout of older objects.
 func (m *Maps) ReadStats() (SchedStats, error) {
 	var out SchedStats
 	if m.Stats == nil {
@@ -236,23 +239,13 @@ func (m *Maps) UpdatePodParams(pod *corev1.Pod, resolved ...SchedParams) error {
 	if m.CgroupParams != nil {
 		cgids := resolvePodCgroupIDs(uid)
 		if len(cgids) > 0 {
-			written := make([]uint64, 0, len(cgids))
-			for _, cgid := range cgids {
-				key := cgid
-				if err := m.CgroupParams.Put(&key, &tp); err != nil {
-					if firstErr == nil {
-						firstErr = fmt.Errorf("put cgroup %d: %w", cgid, err)
-					}
-					continue
-				}
-				written = append(written, key)
-			}
+			written, err := writeCgroupParams(m, cgids, &tp)
 			if uid != "" {
 				m.mu.Lock()
 				m.podCgroupIDs[uid] = written
 				m.mu.Unlock()
 			}
-			return firstErr
+			return err
 		}
 	}
 
@@ -278,6 +271,24 @@ func (m *Maps) UpdatePodParams(pod *corev1.Pod, resolved ...SchedParams) error {
 		m.mu.Unlock()
 	}
 	return firstErr
+}
+
+// writeCgroupParams writes one cgroup_params entry per cgroup ID and
+// returns the successfully written keys plus the first error.
+func writeCgroupParams(m *Maps, cgids []uint64, tp *TaskParams) ([]uint64, error) {
+	var firstErr error
+	written := make([]uint64, 0, len(cgids))
+	for _, cgid := range cgids {
+		key := cgid
+		if err := m.CgroupParams.Put(&key, tp); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("put cgroup %d: %w", cgid, err)
+			}
+			continue
+		}
+		written = append(written, key)
+	}
+	return written, firstErr
 }
 
 // RemovePodParams deletes the cgroup_params and task_params entries
@@ -534,7 +545,7 @@ func resolveViaCgroupV2(podUID string) []int32 {
 		}
 		data, rerr := os.ReadFile(filepath.Join(path, "cgroup.procs"))
 		if rerr != nil {
-			return nil
+			return nil //nolint:nilerr // best-effort: skip unreadable entries
 		}
 		pids = append(pids, parseCgroupProcs(data)...)
 		return nil

@@ -150,9 +150,9 @@ func podRelevantFieldsChanged(oldPod, newPod *corev1.Pod) bool {
 // used to detect container (re)starts without re-resolving on every
 // status heartbeat.
 func containerIDs(pod *corev1.Pod) []string {
-	var ids []string
-	for _, cs := range pod.Status.ContainerStatuses {
-		ids = append(ids, cs.ContainerID)
+	ids := make([]string, 0, len(pod.Status.ContainerStatuses))
+	for i := range pod.Status.ContainerStatuses {
+		ids = append(ids, pod.Status.ContainerStatuses[i].ContainerID)
 	}
 	return ids
 }

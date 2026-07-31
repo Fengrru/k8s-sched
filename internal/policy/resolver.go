@@ -277,7 +277,7 @@ func (r *Resolver) SetPolicyErrorHandler(h func(policyName string, err error)) {
 // no matching policy and no annotation sets one. This gives
 // best-effort work a low priority and guaranteed work the default
 // priority with zero configuration — the flat vtime pool always
-// favours latency-critical pods.
+// favors latency-critical pods.
 func qosDefaultWeight(qos corev1.PodQOSClass) uint64 {
 	switch qos {
 	case corev1.PodQOSGuaranteed:
