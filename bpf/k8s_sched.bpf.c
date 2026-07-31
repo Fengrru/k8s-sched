@@ -200,7 +200,7 @@ s32 BPF_STRUCT_OPS(k8s_select_cpu, struct task_struct *p,
 
 		lookup_task_params(p, &tp);
 		slice = task_slice(&tp);
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice, 0);
+		scx_dsq_insert(p, SCX_DSQ_LOCAL, slice, 0);
 
 		struct sched_stats *s = get_stats();
 		if (s) {
@@ -228,7 +228,7 @@ void BPF_STRUCT_OPS(k8s_enqueue, struct task_struct *p, u64 enq_flags)
 	if (vtime_before(vtime, vtime_now - DEFAULT_SLICE_NS))
 		vtime = vtime_now - DEFAULT_SLICE_NS;
 
-	scx_bpf_dsq_insert_vtime(p, K8S_DSQ_ID, slice, vtime, enq_flags);
+	scx_dsq_insert_vtime(p, K8S_DSQ_ID, slice, vtime, enq_flags);
 
 	struct sched_stats *s = get_stats();
 	if (s) {
@@ -249,7 +249,7 @@ void BPF_STRUCT_OPS(k8s_dispatch, s32 cpu, struct task_struct *prev)
 	 * CPU's local DSQ. All tasks pass through k8s_enqueue, so
 	 * there is nothing to consume from the global DSQ.
 	 */
-	scx_bpf_dsq_move_to_local(K8S_DSQ_ID);
+	scx_dsq_move_to_local(K8S_DSQ_ID);
 }
 
 void BPF_STRUCT_OPS(k8s_running, struct task_struct *p)

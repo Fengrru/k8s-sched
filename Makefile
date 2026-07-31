@@ -14,9 +14,19 @@ generate:
 	$(MAKE) generate-ebpf
 	$(MAKE) manifests
 
-# Compile eBPF C to .o (requires bpf/vmlinux.h, see generate-vmlinux)
+# Compile eBPF C to .o (requires bpf/vmlinux.h, see generate-vmlinux).
+# -DSCX_KERNEL_MAJOR/-DSCX_KERNEL_MINOR select the sched_ext kfunc naming
+# for the running kernel: pre-6.13 (scx_bpf_dispatch & friends) vs 6.13+
+# (renamed scx_bpf_dsq_insert & friends); see bpf/scx_common.bpf.h.
 generate-ebpf:
-	clang -O2 -target bpf -g -I bpf -I include -c bpf/k8s_sched.bpf.c -o bpf/k8s_sched.bpf.o
+	@KVER="$$(uname -r 2>/dev/null | cut -d. -f1-2)"; \
+	if [ -n "$$KVER" ]; then \
+		KMACRO="-DSCX_KERNEL_MAJOR=$${KVER%%.*} -DSCX_KERNEL_MINOR=$${KVER##*.}"; \
+	else \
+		KMACRO=""; \
+	fi; \
+	clang -O2 -target bpf -g -I bpf -I include $$KMACRO \
+		-c bpf/k8s_sched.bpf.c -o bpf/k8s_sched.bpf.o
 
 # Generate vmlinux.h from running kernel BTF.
 # Required for BPF compilation on the target kernel.

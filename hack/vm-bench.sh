@@ -34,8 +34,14 @@ apt-get install -y -qq schbench stress-ng >/dev/null 2>&1 || \
 	echo "WARNING: benchmark tools unavailable (schbench/stress-ng), results will be empty"
 
 # 2. vmlinux.h from the exact kernel, then compile the BPF scheduler.
+#    -DSCX_KERNEL_MAJOR/MINOR select the sched_ext kfunc naming for this
+#    kernel: pre-6.13 uses scx_bpf_dispatch()/dispatch_vtime()/consume(),
+#    6.13+ uses the renamed scx_bpf_dsq_insert()/insert_vtime()/move_to_local().
 ./bin/bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h
-clang -O2 -target bpf -g -I bpf -I include -c bpf/k8s_sched.bpf.c -o bpf/k8s_sched.bpf.o
+KMAJOR="$(uname -r | cut -d. -f1)"
+KMINOR="$(uname -r | cut -d. -f2)"
+clang -O2 -target bpf -g -DSCX_KERNEL_MAJOR="$KMAJOR" -DSCX_KERNEL_MINOR="$KMINOR" \
+	-I bpf -I include -c bpf/k8s_sched.bpf.c -o bpf/k8s_sched.bpf.o
 
 # 3. Workload: 4 worker groups x 8 threads, 15s, under 4 stress-ng CPU
 # burners. Tune SCHED_BENCH_ARGS / STRESS_ARGS via env.

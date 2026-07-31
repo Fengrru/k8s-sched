@@ -30,7 +30,13 @@ fi
 ./bin/bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h
 
 # 2. Compile BPF C -> .o (same invocation as `make generate-ebpf`).
-clang -O2 -target bpf -g -I bpf -I include -c bpf/k8s_sched.bpf.c -o bpf/k8s_sched.bpf.o
+#    -DSCX_KERNEL_MAJOR/MINOR select the sched_ext kfunc naming for this
+#    kernel: pre-6.13 uses scx_bpf_dispatch()/dispatch_vtime()/consume(),
+#    6.13+ uses the renamed scx_bpf_dsq_insert()/insert_vtime()/move_to_local().
+KMAJOR="$(uname -r | cut -d. -f1)"
+KMINOR="$(uname -r | cut -d. -f2)"
+clang -O2 -target bpf -g -DSCX_KERNEL_MAJOR="$KMAJOR" -DSCX_KERNEL_MINOR="$KMINOR" \
+	-I bpf -I include -c bpf/k8s_sched.bpf.c -o bpf/k8s_sched.bpf.o
 
 # 3. Load, attach, and verify the scheduler end to end.
 mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf
